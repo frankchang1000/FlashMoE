@@ -538,7 +538,12 @@ namespace flashmoe{
     enum class TaskType : uint16_t {
         preGEMM,
         postGEMM,
-        combine
+        combine,
+        // for backward pass, reverse order of w1 and w2
+        gradPreGEMM,     // grad_output * W2^T -> grad_intermediate
+        gradPostGEMM,    // grad_intermediate * W1^T -> grad_input
+        gradWeights,     // compute weight gradients
+        gradCombine      // distribute gradients to experts
     };
 
     enum class EP {
