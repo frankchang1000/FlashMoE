@@ -435,6 +435,8 @@ namespace flashmoe{
     enum SignalConstants : flagsType {
         ground = 0U,
         sequenceStart = 1U,
+        gradGround = 4U,
+        gradSequenceStart = 5U,
     };
     __inline__ uint16_t seqBit = sequenceStart;
     /// Flashmoe Compile-time Config
@@ -447,7 +449,7 @@ namespace flashmoe{
         // TODO write a proof for the below in the paper
         // sequence bit states necessary to break symmetry in forward or backward detection
         // includes ground state
-        using SBS = cute::C<2U * (2U + AEE::value)>;
+        using SBS = cute::C<8U>; // 0-3 forward (1->2->3->1 via sbs::next()), 4-7 gradient (5->6->7->5) via sbs::nextGrad())
         using GRL = cute::C<NUM_EXPERTS <= BLOCK_N ? GateReductionLevel::singleBlock :
             GateReductionLevel::multiBlock>;
         using TK = cute::C<E_TOP_K>;
@@ -1050,8 +1052,14 @@ namespace flashmoe{
     namespace sbs {
         __forceinline__ __host__
         constexpr uint16_t next(const uint16_t& current) {
-            return current + 1 == ACC::SBS::value ?
+            return current + 1 == (sequenceStart + 3) ?
                 static_cast<decltype(current)>(sequenceStart) : current + 1;
+        }
+
+        __forceinline__ __host__
+        constexpr uint16_t nextGrad(const uint16_t& current) {
+            return current + 1 == (gradSequenceStart + 3) ?
+                static_cast<decltype(current)>(gradSequenceStart) : current + 1;
         }
 
         __forceinline__ __device__
@@ -1060,8 +1068,10 @@ namespace flashmoe{
                 // this is the case, when we observe the ground state
                 return false;
             }
-            const auto wD =  (ACC::SBS::value - localState) + (receivedState -
-                static_cast<decltype(receivedState)>(sequenceStart));
+            const bool isGrad = localState >= gradSequenceStart;
+            const uint16_t wrapPoint = isGrad ? (gradSequenceStart + 3) : (sequenceStart + 3);
+            const uint16_t spaceStart = isGrad ? gradSequenceStart : sequenceStart;
+            const auto wD = (wrapPoint - localState) + (receivedState - spaceStart);
             return (receivedState > localState && ((receivedState - localState) <= ACC::IDZ::value)) ||
                 (receivedState < localState && wD <= ACC::IDZ::value);
         }
