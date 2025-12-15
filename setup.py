@@ -209,7 +209,11 @@ def get_cuda_extensions():
             '-gencode', 'arch=compute_80,code=sm_80',  # A100
             '-gencode', 'arch=compute_90,code=sm_90',  # H100
             '-Xcompiler', '-fPIC',
-            "-Xfatbin", "-compress-all"
+            "-Xfatbin", "-compress-all",
+            '-U__CUDA_NO_HALF_OPERATORS__',
+            '-U__CUDA_NO_HALF_CONVERSIONS__',
+            '-U__CUDA_NO_BFLOAT16_CONVERSIONS__',
+            '-U__CUDA_NO_HALF2_OPERATORS__',
         ],
         # NOTE(byungsoo): This solves device linking issue while enabling RDC,
         # which is required by NVSHMEM
@@ -223,8 +227,7 @@ def get_cuda_extensions():
     # Define macros from config (this is key for matching your CMake behavior)
     define_macros = []
     
-    # Read kleos_config.json to set compile-time constants
-    config_path = csrc_dir / 'kleos_config.json'
+    config_path = csrc_dir / 'flashmoe_config.json'
     if config_path.exists():
         with open(config_path, 'r') as f:
             config = json.load(f)
@@ -271,6 +274,7 @@ def get_cuda_extensions():
 
         define_macros.extend([
             ('KLEOS_ARCH', str(kleos_arch)),
+            ('FLASHMOE_ARCH', str(kleos_arch)),
             ('NUM_SMS', str(num_sms)),
         ])
 
@@ -283,6 +287,15 @@ def get_cuda_extensions():
             'intermediate_size': 'I_SIZE',
             'moe_frequency': 'MOE_FREQ',
             'capacity_factor': 'CAP_FACTOR',
+            'num_experts': 'NUM_EXPERTS',
+            'drop_tokens': 'DROP_TOKENS',
+            'hidden_act': 'HIDDEN_ACT',
+            'is_training': 'IS_TRAINING',
+            'mini_batch': 'MINI_BATCH',
+            'hidden_size': 'HIDDEN_SIZE',
+            'num_layers': 'NUM_LAYERS',
+            'global_batch': 'GLOBAL_BATCH',
+            'vocab_size': 'VOCAB_SIZE',
         }
 
         # Add the mapped names from config

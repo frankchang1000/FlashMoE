@@ -12,7 +12,7 @@ Simple usage - no manual tensor creation needed:
     flashmoe.run_moe(n_processes=4)
 
 Configuration is compile-time:
-    1. Edit csrc/kleos_config.json
+    1. Edit csrc/flashmoe_config.json
     2. pip install -e . --no-build-isolation
     3. flashmoe.run_moe()
 """

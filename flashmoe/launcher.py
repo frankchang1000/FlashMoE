@@ -9,7 +9,7 @@ import torch
 
 
 def nvshmrun_launcher(
-    config_path: str = "csrc/kleos_config.json",
+    config_path: str = "csrc/flashmoe_config.json",
     n_processes: int = 1,
     processes_per_node: int = 1,
     hostfile: Optional[str] = None,

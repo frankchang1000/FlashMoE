@@ -19,7 +19,7 @@ def run_moe(
     n_processes: int = 1,
     processes_per_node: Optional[int] = None,
     hostfile: Optional[str] = None,
-    config_path: str = "csrc/kleos_config.json"
+    config_path: str = "csrc/flashmoe_config.json"
 ):
     """
     Run MoE forward pass with random tensors for benchmarking/testing.
@@ -45,7 +45,7 @@ def run_moe(
         >>> flashmoe.run_moe(n_processes=16, processes_per_node=8, hostfile="hosts.txt")
     
     Note:
-        To change dimensions, edit csrc/kleos_config.json and rebuild:
+        To change dimensions, edit csrc/flashmoe_config.json and rebuild:
         pip install -e . --no-build-isolation
     """
     if processes_per_node is None:
