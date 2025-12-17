@@ -204,6 +204,191 @@ namespace flashmoe::processor{
         }
     }
 
+    template<
+        CombineMode c = CombineMode::single,
+        unsigned int gM = BLOCK_M,
+        unsigned int M = ACC::S::value,
+        unsigned int N = ACC::H::value,
+        class ScaleWeights,
+        typename Element,
+        unsigned int elems = ACC::Elems::value,
+        unsigned int threads = ACC::PeakHardware::OS::threads::value,
+        unsigned int sharedSize = ACC::PeakHardware::sharedMemory::value + ACC::PeakHardware::spare::value,
+        unsigned int wS = WARP_SIZE
+    >
+    requires(TensorValueType<Element> &&
+            elems % wS == 0 &&
+            flashmoe::isMatrix<ScaleWeights> &&
+            cuda::std::is_same_v<typename ScaleWeights::value_type, Element>)
+    __device__ __forceinline__
+    void splitGradients(cuda::std::byte* __restrict__ const& workspace,
+            const TPS* __restrict__ const& tokenIndices,
+            const Element* __restrict__ const& gradOutput,
+            Element* __restrict__ const& expertGradients,
+            ScaleWeights const& scale,
+            const unsigned int& tileIdx,
+            const uint16_t& tileSize,
+            const uint16_t& expertIdx) {
+        using BlockTiler = cute::Shape<cute::Int<BLOCK_M>, cute::Int<BLOCK_N>>;
+        constexpr BlockTiler tiler{};
+        constexpr auto bM = cute::get<0>(tiler);
+        constexpr auto bN = cute::get<1>(tiler);
+        cutlass::Array<Element, bN> registers{};
+        constexpr auto mTe = cutlass::NumericConverter<Element, mp_t>{};
+        constexpr auto eTm = cutlass::NumericConverter<mp_t, Element>{};
+        const auto mGradOut = make_tensor(cute::make_gmem_ptr(gradOutput),
+            cute::Layout<cute::Shape<cute::Int<M>, cute::Int<N>>,
+                cute::Stride<cute::Int<N>, cute::_1>>{});
+        const auto mExpertGrad = make_tensor(cute::make_gmem_ptr(expertGradients),
+            cute::Layout<cute::Shape<cute::Int<gM>, cute::Int<N>>,
+                cute::Stride<cute::Int<N>, cute::_1>>{});
+
+        static_assert(gM % bM == 0);
+        constexpr auto tilesM = gM / bM;
+        constexpr auto tilesN = N / bN;
+
+        const auto tileCoordOut = idx2crd(tileIdx,
+            cute::Shape<cute::_1, cute::Int<tilesN>>{},
+                cute::Stride<cute::Int<tilesN>, cute::_1>{});
+        const auto gGradOut = cute::local_tile(mGradOut,
+            cute::Shape<cute::Int<M>, cute::Int<bN>>{},
+                cute::make_coord(cute::get<0>(tileCoordOut),
+                    cute::get<1>(tileCoordOut)));
+
+        const auto tileCoord = idx2crd(tileIdx,
+            cute::Shape<cute::Int<tilesM>, cute::Int<tilesN>>{},
+                cute::Stride<cute::Int<tilesN>, cute::_1>{});
+        const auto ctaCoord = cute::make_coord(cute::get<0>(tileCoord), cute::get<1>(tileCoord));
+        const auto gExpertGrad = cute::local_tile(mExpertGrad, tiler, ctaCoord);
+
+        static_assert(bN % elems == 0);
+        constexpr auto trips = bN / elems;
+        static_assert(sizeof(TPS) * bM <= sharedSize);
+        static_assert(bM % elems == 0);
+        constexpr auto phases = bM / elems;
+        const auto phaseIdx = threadIdx.x / elems;
+        static_assert(elems % wS == 0);
+        constexpr auto wE = elems / wS;
+        auto* __restrict__ sTPS = CAST_TO(TPS, workspace);
+        static_assert(bM == threads);
+        sTPS[threadIdx.x] = tokenIndices[threadIdx.x];
+        __syncthreads();
+
+        if constexpr (c == CombineMode::multithreaded) {
+            TPS wT[wE];
+            Element rS[wE];
+            #pragma unroll
+            for (uint i = 0; i < wE; ++i) {
+                const auto tid = threadIdx.x % wS;
+                wT[i] = sTPS[phaseIdx + (tid + i * wS) * phases];
+                rS[i] = scale(wT[i].tokenIdx, expertIdx);
+            }
+            __syncwarp();
+            cutlass::Array<uint, elems> tIds{};
+            using CDxT = typename ToCDx<Element>::T;
+            constexpr auto cTCx = cutlass::NumericConverter<CDxT, Element>{};
+            const auto rC = cute::make_tensor(cute::make_rmem_ptr(CAST_TO(CDxT, registers.data())),
+                cute::Layout<cute::Shape<cute::_1, cute::Int<bN>>, cute::Stride<cute::Int<bN>, cute::_1>>{});
+            #pragma unroll
+            for (uint j = 0; j < elems; ++j) {
+                const auto msg = wT[j / wS];
+                const auto* __restrict__ mP = CONST_CAST_TO(ull_t, &msg);
+                const auto rM = __shfl_sync(0xffffffff, *mP, j % wS);
+                const auto [tokenIdx, probability] = *CONST_CAST_TO(TPS, &rM);
+                tIds[j] = tokenIdx;
+            }
+            #pragma unroll
+            for (uint i = 0; i < trips; ++i) {
+                #pragma unroll
+                for (uint j = 0; j < elems; ++j) {
+                    const auto cIdx = threadIdx.x % elems + i * elems;
+                    registers[j + i * elems] = gGradOut(tIds[j], cIdx);
+                }
+            }
+            #pragma unroll
+            for (uint j = 0; j < elems; ++j) {
+                const auto msg = wT[j / wS];
+                const auto* __restrict__ mP = CONST_CAST_TO(ull_t, &msg);
+                const auto rM = __shfl_sync(0xffffffff, *mP, j % wS);
+                const auto [tokenIdx, probability] = *CONST_CAST_TO(TPS, &rM);
+                #pragma unroll
+                for (uint i = 0; i < trips; ++i) {
+                    registers[i + j * elems] = mTe(__fdividef(eTm(registers[i + j * elems]), probability));
+                }
+            }
+            #pragma unroll
+            for (uint j = 0; j < elems; ++j) {
+                const auto msg = rS[j / wS];
+                const auto* __restrict__ mP = CONST_CAST_TO(CDxT, &msg);
+                const auto rM = __shfl_sync(0xffffffff, *mP, j % wS);
+                #pragma unroll
+                for (uint i = 0; i < trips; ++i) {
+                    rC(j + i * elems) = cTCx(*CONST_CAST_TO(Element, &rM) * registers[j + i * elems]);
+                }
+            }
+            #pragma unroll
+            for (uint i = 0; i < trips; ++i) {
+                if (tileSize < gM) {
+                    #pragma unroll
+                    for (uint j = 0; j < elems; ++j) {
+                        const auto cIdx = threadIdx.x % elems + i * elems;
+                        if (phaseIdx + j * phases < tileSize) {
+                            atomicAdd(CAST_TO(CDxT, &gExpertGrad(phaseIdx + j * phases, cIdx)), rC(j + i * elems));
+                        }
+                    }
+                }
+                else {
+                    #pragma unroll
+                    for (uint j = 0; j < elems; ++j) {
+                        const auto cIdx = threadIdx.x % elems + i * elems;
+                        atomicAdd(CAST_TO(CDxT, &gExpertGrad(phaseIdx + j * phases, cIdx)), rC(j + i * elems));
+                    }
+                }
+            }
+        }
+        else {
+            uint wT[wE];
+            const auto tid = threadIdx.x % wS;
+            #pragma unroll
+            for (uint i = 0; i < wE; ++i) {
+                wT[i] = sTPS[phaseIdx + (tid + i * wS) * phases].tokenIdx;
+            }
+            cutlass::AlignedArray<uint, elems> tIds{};
+            __syncwarp();
+            #pragma unroll
+            for (uint j = 0; j < elems; ++j) {
+                const auto msg = wT[j / wS];
+                tIds[j] = __shfl_sync(0xffffffff, msg, j % wS);
+            }
+            #pragma unroll
+            for (uint i = 0; i < trips; ++i) {
+                #pragma unroll
+                for (uint j = 0; j < elems; ++j) {
+                    const auto cIdx = threadIdx.x % elems + i * elems;
+                    registers[j + i * elems] = gGradOut(tIds[j], cIdx);
+                }
+            }
+            #pragma unroll
+            for (uint i = 0; i < trips; ++i) {
+                const auto cIdx = threadIdx.x % elems + i * elems;
+                if (tileSize < gM) {
+                    #pragma unroll
+                    for (uint j = 0; j < elems; ++j) {
+                        if (phaseIdx + j * phases < tileSize) {
+                            gExpertGrad(phaseIdx + j * phases, cIdx) = registers[j + i * elems];
+                        }
+                    }
+                }
+                else {
+                    #pragma unroll
+                    for (uint j = 0; j < elems; ++j) {
+                        gExpertGrad(phaseIdx + j * phases, cIdx) = registers[j + i * elems];
+                    }
+                }
+            }
+        }
+    }
+
     // fused GEMM, epilogue and data transfer, with static M, N and K
     template<
         typename BlockGEMM,
@@ -636,6 +821,150 @@ namespace flashmoe::processor{
     }
 
     template<
+        PeerConnectivity p,
+        unsigned int tasks = ACC::TNx::value
+    >
+    __device__ __forceinline__
+    void notifyGradient(uint* __restrict__ const& workspace, const Task& rCurrentTask, const ProcessorArgs& pA) {
+        static_assert(sizeof(Task) == 128);
+        constexpr auto eS = sizeof(Task) / sizeof(uint);
+        static_assert(eS == WARP_SIZE);
+        constexpr auto threads = ACC::PeakHardware::OS::threads::value;
+        constexpr auto sharedSize = ACC::sharedSize::value;
+        static_assert(sharedSize % sizeof(Task) == 0);
+        static_assert(sharedSize / sizeof(Task) >= threads);
+        constexpr auto capacity = threads;
+        constexpr auto trips = tasks / capacity;
+        static_assert(threads % eS == 0);
+        static_assert(capacity % threads == 0);
+        constexpr auto elems = capacity * eS / threads;
+        constexpr unsigned int gradIndex = 0;
+
+        const auto offset = ACC::TNx::value * rCurrentTask.batchIdx;
+        auto* __restrict__ tQ = CAST_TO(uint, pA.ptQ + (rCurrentTask.syncIdx * ACC::TNx::value));
+        const auto cIdx = threadIdx.x % eS;
+        const auto sTQ = make_tensor(cute::make_smem_ptr(workspace),
+            cute::Layout<cute::Shape<cute::Int<threads>, cute::Int<eS>>,
+                cute::Stride<cute::Int<eS>, cute::_1>>{});
+        const auto gTQ = make_tensor(cute::make_gmem_ptr(tQ),
+            cute::Layout<cute::Shape<cute::Int<tasks>, cute::Int<eS>>,
+                cute::Stride<cute::Int<eS>, cute::_1>>{});
+        if constexpr (trips) {
+            const auto rIdx = threadIdx.x / eS * eS;
+            #pragma unroll
+            for (uint i = 0; i < trips; ++i) {
+                const auto taskIdx = threadIdx.x + i * capacity;
+                const auto tileIdx = offset + taskIdx;
+                const auto nextTask = Task {
+                    TaskType::gradPostGEMM,
+                    rCurrentTask.cData[gradIndex],
+                    rCurrentTask.bData,
+                    rCurrentTask.cData,
+                    rCurrentTask.dData,
+                    rCurrentTask.rcData,
+                    rCurrentTask.flags + offset + (p == PeerConnectivity::p2p ? taskIdx : 0),
+                    rCurrentTask.syncIdx,
+                    tileIdx,
+                    rCurrentTask.M,
+                    rCurrentTask.tileSize,
+                    rCurrentTask.peerIdx,
+                    rCurrentTask.batchIdx,
+                    rCurrentTask.isPeerRemote,
+                };
+                const auto* __restrict__ uT = CONST_CAST_TO(uint, &nextTask);
+                #pragma unroll
+                for (uint j = 0; j < eS; ++j) {
+                    const auto swizzleIdx = (j + threadIdx.x) % eS;
+                    sTQ(threadIdx.x, swizzleIdx) = uT[j];
+                }
+                __syncthreads();
+                #pragma unroll
+                for (uint j = 0; j < elems; ++j) {
+                    gTQ(rIdx + (j + i * capacity), cIdx) = sTQ(rIdx + j, (cIdx + j) % eS);
+                }
+            }
+            __syncthreads();
+        }
+        if constexpr (constexpr auto residue = tasks - trips * capacity; residue) {
+            if (threadIdx.x < residue) {
+                const auto taskIdx = threadIdx.x + trips * capacity;
+                const auto tileIdx = offset + taskIdx;
+                const auto nextTask = Task {
+                    TaskType::gradPostGEMM,
+                    rCurrentTask.cData[gradIndex],
+                    rCurrentTask.bData,
+                    rCurrentTask.cData,
+                    rCurrentTask.dData,
+                    rCurrentTask.rcData,
+                    rCurrentTask.flags + offset + (p == PeerConnectivity::p2p ? taskIdx : 0),
+                    rCurrentTask.syncIdx,
+                    tileIdx,
+                    rCurrentTask.M,
+                    rCurrentTask.tileSize,
+                    rCurrentTask.peerIdx,
+                    rCurrentTask.batchIdx,
+                    rCurrentTask.isPeerRemote,
+                };
+                const auto* __restrict__ uT = CONST_CAST_TO(uint, &nextTask);
+                #pragma unroll
+                for (uint j = 0; j < eS; ++j) {
+                    const auto swizzleIdx = (j + threadIdx.x) % eS;
+                    sTQ(threadIdx.x, swizzleIdx) = uT[j];
+                }
+            }
+            __syncthreads();
+            constexpr auto stride = threads / eS;
+            const auto pIdx = threadIdx.x / eS;
+            constexpr auto length = residue / stride;
+            #pragma unroll
+            for (uint j = 0; j < length; ++j) {
+                const auto idx = j * stride + pIdx;
+                gTQ(idx + trips * capacity, cIdx) = sTQ(idx, (cIdx + idx) % eS);
+            }
+            if constexpr (constexpr auto rS = residue % stride; rS) {
+                if (pIdx < rS) {
+                    const auto idx = length * stride + pIdx;
+                    gTQ(idx + trips * capacity, cIdx) = sTQ(idx, (cIdx + idx) % eS);
+                }
+            }
+        }
+
+        __syncthreads();
+        if (!threadIdx.x) {
+            __threadfence();
+            atomicAdd(pA.tQH + rCurrentTask.syncIdx, tasks);
+        }
+    }
+
+    __device__ __forceinline__
+    void enqueueTask(const Task& task, const ProcessorArgs& pA) {
+        static_assert(sizeof(Task) == 128);
+        constexpr auto eS = sizeof(Task) / sizeof(uint);
+        static_assert(eS == WARP_SIZE);
+        constexpr auto threads = ACC::PeakHardware::OS::threads::value;
+        constexpr auto sharedSize = ACC::sharedSize::value;
+        static_assert(sharedSize % sizeof(Task) == 0);
+        static_assert(sharedSize / sizeof(Task) >= threads);
+
+        __shared__ uint sTask[eS];
+        if (threadIdx.x < eS) {
+            const auto* __restrict__ uT = CONST_CAST_TO(uint, &task);
+            sTask[threadIdx.x] = uT[threadIdx.x];
+        }
+        __syncthreads();
+
+        if (!threadIdx.x) {
+            const auto taskIdx = atomicAdd(pA.tQH + task.syncIdx, 1U);
+            auto* __restrict__ tQ = CAST_TO(uint, pA.tQ + taskIdx);
+            #pragma unroll
+            for (uint i = 0; i < eS; ++i) {
+                tQ[i] = sTask[i];
+            }
+            __threadfence();
+        }
+    }
+
+    template<
         typename ScaleWeights,
         typename Output
     >
@@ -671,6 +1000,8 @@ namespace flashmoe::processor{
         }
         using PreGEMM = BlockMM<ACC::ActivationOp, Element>;
         using PostGEMM = BlockMM<ACC::ActivationOpX, Element>;
+        using GradPreGEMM = BlockMM<flashmoe::ActivationDerivative<ACC::ElementC, ACC::ActivationOp>, Element>;
+        using GradPostGEMM = BlockMM<flashmoe::ActivationDerivative<ACC::ElementC, ACC::ActivationOpX>, Element>;
         constexpr uint H = ACC::H::value;
         constexpr auto tN = ACC::TN::value;
         constexpr auto tNx = ACC::TNx::value;
