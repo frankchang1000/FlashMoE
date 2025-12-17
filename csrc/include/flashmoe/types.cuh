@@ -777,7 +777,7 @@ namespace flashmoe{
                         cute::ceil_div(TCM * TN, WARP_SIZE) +
                         cute::ceil_div(TCM * E, SUBSCRIBERS) * ACC::TNx::value;
                 sT = tPS * SUBSCRIBERS;
-                ilt = 1 + nLx + blocks + 2 * (gtQCl + E) + E * TCM * TNx;
+                ilt = 1 + 1 + nLx + blocks + 2 * (gtQCl + E) + E * TCM * TNx;
             }
         }
 

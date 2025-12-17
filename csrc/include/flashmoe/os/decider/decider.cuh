@@ -48,6 +48,9 @@ namespace flashmoe{
             const unsigned int& totalExpertMem,
             uint* __restrict__ deviceToGroups) const {
             const auto world = cute::size<0>(adjMatrix);
+            FLASHMOE_ASSERT(world >= 2,
+                "Training mode currently requires >= 2 NVSHMEM ranks. "
+                "Launch with nvshmemrun/mpirun -np >= 2 or disable is_training.");
             auto infeasibleGroups = std::unordered_set<unsigned int>{};
             for(uint i = 0; i < world; ++i){
                 if(const auto w = workers[i]; w.memoryCapacity < totalExpertMem)
@@ -170,7 +173,7 @@ namespace flashmoe{
                 deviceToGroups[i++] = static_cast<uint>(groupId);
             }
 
-            return infeasibleGroups.size() > 0; // provably, this can only be 0 or 1
+            return infeasibleGroups.size() == 0; // provably, this can only be 0 or 1
         }
     };
     // No gradient all reduce modeling here
