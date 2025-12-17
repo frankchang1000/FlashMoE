@@ -375,6 +375,7 @@ namespace flashmoe{
         ELI* bookELI = nullptr;
         BookType* book = nullptr;
         cuda::std::byte* bookElement = nullptr;
+        Element* gradWeights = nullptr;
 
         FLASHMOE_CHECK_CUDA(cudaMallocAsync(&bookTask, sizeof(Task) * Bookkeeping::tQlt(ePgD.nLx, ePgD.epWorld), flashmoeStream));
         FLASHMOE_CHECK_CUDA(cudaMallocAsync(&bookPEL, sizeof(PEL) * ACC::E::value, flashmoeStream));
@@ -394,11 +395,19 @@ namespace flashmoe{
         fflush(stdout);
         FLASHMOE_CHECK_CUDA(cudaMallocAsync(&book, sizeof(BookType) * book_b4lt, flashmoeStream));
         FLASHMOE_CHECK_CUDA(cudaMallocAsync(&bookElement, sizeof(ACC::Element) * Bookkeeping::xMlt(ePgD.nLx, ePgD.epWorld), flashmoeStream));
+        if constexpr (ACC::JT::value == JobType::training) {
+            FLASHMOE_CHECK_CUDA(cudaMallocAsync(&gradWeights,
+                sizeof(Element) * Bookkeeping::gWlt(ePgD.nLx), flashmoeStream));
+        }
         // Initialize bookkeeping
         FLASHMOE_CHECK_CUDA(cudaMemsetAsync(book, 0, sizeof(BookType) * book_b4lt, flashmoeStream));
         FLASHMOE_CHECK_CUDA(cudaMemsetAsync(bookTQS, 0, sizeof(TQSignal) * Bookkeeping::pDBlt(), flashmoeStream));
         FLASHMOE_CHECK_CUDA(cudaMemsetAsync(bookRSP, 0, sizeof(RingSoftmaxPayload) * Bookkeeping::rSlt(), flashmoeStream));
         FLASHMOE_CHECK_CUDA(cudaMemsetAsync(bookRTP, 0, sizeof(RingTopKPayload) * Bookkeeping::rTlt(), flashmoeStream));
+        if constexpr (ACC::JT::value == JobType::training) {
+            FLASHMOE_CHECK_CUDA(cudaMemsetAsync(gradWeights, 0,
+                sizeof(Element) * Bookkeeping::gWlt(ePgD.nLx), flashmoeStream));
+        }
         hostBookkeeping = Bookkeeping{
             flags,
             sHeap,
@@ -413,6 +422,7 @@ namespace flashmoe{
             bookELI,
             book,
             bookElement,
+            gradWeights,
             ePgD
         };
         
@@ -538,13 +548,21 @@ namespace flashmoe{
     template<>
     __host__ __forceinline__
     void distributedInit<EP::no>() {
+        using Element = ACC::Element;
         BookType* book = nullptr;
         cuda::std::byte* bookElement = nullptr;
+        Element* gradWeights = nullptr;
         FLASHMOE_CHECK_CUDA(cudaMallocAsync(&book,
             sizeof(BookType) * Bookkeeping::b4lt(), flashmoeStream));
         FLASHMOE_CHECK_CUDA(cudaMallocAsync(&bookElement,
             sizeof(ACC::Element) * Bookkeeping::xMlt(), flashmoeStream));
-        hostBookkeeping = Bookkeeping{book, bookElement};
+        if constexpr (ACC::JT::value == JobType::training) {
+            FLASHMOE_CHECK_CUDA(cudaMallocAsync(&gradWeights,
+                sizeof(Element) * Bookkeeping::gWlt(ACC::E::value), flashmoeStream));
+            FLASHMOE_CHECK_CUDA(cudaMemsetAsync(gradWeights, 0,
+                sizeof(Element) * Bookkeeping::gWlt(ACC::E::value), flashmoeStream));
+        }
+        hostBookkeeping = Bookkeeping{book, bookElement, gradWeights};
         FLASHMOE_CHECK_CUDA(cudaMemcpyToSymbolAsync(bookkeeping, &hostBookkeeping,
             sizeof(Bookkeeping), 0,
             cudaMemcpyHostToDevice, flashmoeStream));
@@ -602,6 +620,11 @@ namespace flashmoe{
         FLASHMOE_CHECK_CUDA(cudaFreeAsync(hostBookkeeping.book, flashmoeStream));
         FLASHMOE_CHECK_CUDA(cudaPeekAtLastError());
         FLASHMOE_CHECK_CUDA(cudaFreeAsync(hostBookkeeping.bookElement, flashmoeStream));
+        if constexpr (ACC::JT::value == JobType::training) {
+            if (hostBookkeeping.gradWeights != nullptr) {
+                FLASHMOE_CHECK_CUDA(cudaFreeAsync(hostBookkeeping.gradWeights, flashmoeStream));
+            }
+        }
         // Below ensures all work is done before deallocating via the external API
         FLASHMOE_CHECK_CUDA(cudaStreamSynchronize(flashmoeStream));
         nvshmem_free(hostBookkeeping.flags);

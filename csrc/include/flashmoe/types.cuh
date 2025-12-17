@@ -13,6 +13,10 @@
 #ifndef FLASHMOE_TYPES_CUH
 #define FLASHMOE_TYPES_CUH
 
+#ifndef IS_TRAINING
+#define IS_TRAINING 0
+#endif
+
 #define FLASHMOE_BLOCK_SIZE 128U
 #define FLASHMOE_BLOCK_SIZE_WARP (128U / 32)
 #define FLASHMOE_STATIC_SBZ 32U
@@ -20,7 +24,7 @@
 #define CAST_TO(T, p) static_cast<T*>(static_cast<void*>(p))
 #define CONST_CAST_TO(T, p) static_cast<const T*>(static_cast<const void*>(p))
 /// Number of communication stages S
-#define STAGES 2U
+#define STAGES (IS_TRAINING ? 4U : 2U)
 
 /// Per stage, there is one cell for sending and another for reception
 #define CELLS 2U
@@ -715,6 +719,7 @@ namespace flashmoe{
         ELI* bookELI = nullptr;
         BookType* book = nullptr;
         cuda::std::byte* bookElement = nullptr;
+        ACC::Element* gradWeights = nullptr;
         unsigned long int ilt = 0U;
         unsigned int gtQCl = 0U;
         unsigned int sT = 0U;
@@ -745,6 +750,7 @@ namespace flashmoe{
             ELI* const& _bookELI,
             BookType* const& _book,
             cuda::std::byte* const& _bookElement,
+            ACC::Element* const& _gradWeights,
             const EPG& ePgD) :
                 flags(_flags),
                 sHeap(_sHeap),
@@ -759,6 +765,7 @@ namespace flashmoe{
                 bookELI(_bookELI),
                 book(_book),
                 bookElement(_bookElement),
+                gradWeights(_gradWeights),
                 rank(ePgD.epRank),
                 world(ePgD.epWorld),
                 nLx(ePgD.nLx),
@@ -781,8 +788,9 @@ namespace flashmoe{
             }
         }
 
-        Bookkeeping(BookType* const& _book, cuda::std::byte* const& _bookElement) :
-        book(_book), bookElement(_bookElement){}
+        Bookkeeping(BookType* const& _book, cuda::std::byte* const& _bookElement,
+            ACC::Element* const& _gradWeights = nullptr) :
+        book(_book), bookElement(_bookElement), gradWeights(_gradWeights){}
 
         template<unsigned int tileDimension>
         __host__ __device__ __forceinline__
@@ -963,6 +971,14 @@ namespace flashmoe{
         auto* gL() const {
             return gMeC() + ACC::E::value;
         }
+        /// expert gradients
+        __device__ __forceinline__
+        auto* gW() const {
+            return gradWeights;
+        }
+        constexpr static auto gWlt(const unsigned int& _nLx) {
+            return (2 * ACC::P::value * ACC::H::value + ACC::P::value + ACC::H::value) * _nLx;
+        }
         /***********CONTIGUOUS**************/
         constexpr static auto b4lt(const unsigned int& _nLx, const unsigned int& _world) {
             constexpr auto blocks = ACC::PeakHardware::OS::processorBlocks::value;
@@ -1003,7 +1019,9 @@ namespace flashmoe{
                     sizeof(RingTopKPayload) * rTlt() +
                     sizeof(ELI) * eLlt() +
                     sizeof(BookType) * b4lt(_nLx, _world) +
-                    sizeof(ACC::Element) * xMlt(_nLx, _world);
+                    sizeof(ACC::Element) * xMlt(_nLx, _world) +
+                    (ACC::JT::value == JobType::training ?
+                        sizeof(ACC::Element) * gWlt(_nLx) : 0UL);
         }
 
         /// For fffn
