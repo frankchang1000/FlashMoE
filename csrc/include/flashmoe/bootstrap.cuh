@@ -349,6 +349,8 @@ namespace flashmoe{
             ACC::H::value;
         const auto flagElems = (ePgD.epWorldM * ePgD.expertSlots + E * ACC::TCM::value * ACC::TNx::value);
         auto tHB = flagElems * sizeof(flagsType) + heapElems * sizeof(Element);
+        printf("DEBUG: Before nvshmem alloc - heapElems=%lu, flagElems=%lu, tHB=%lu\n", heapElems, flagElems, tHB);
+        fflush(stdout);
         // Required for large allocations
         const auto nss = gEI("NVSHMEM_SYMMETRIC_SIZE", ACC::SZD::value); // default is 1GB
         if (tHB >= nss) {
@@ -387,11 +389,13 @@ namespace flashmoe{
         FLASHMOE_CHECK_CUDA(cudaMallocAsync(&bookRTP, sizeof(RingTopKPayload) * Bookkeeping::rTlt(),
             flashmoeStream));
         FLASHMOE_CHECK_CUDA(cudaMallocAsync(&bookELI, sizeof(ELI) * Bookkeeping::eLlt(), flashmoeStream));
-        FLASHMOE_CHECK_CUDA(cudaMallocAsync(&book, sizeof(BookType) * Bookkeeping::b4lt(ePgD.nLx, ePgD.epWorld), flashmoeStream));
+        const auto book_b4lt = Bookkeeping::b4lt(ePgD.nLx, ePgD.epWorld);
+        printf("DEBUG: Allocating book buffer: b4lt=%lu, size=%lu bytes\n", book_b4lt, sizeof(BookType) * book_b4lt);
+        fflush(stdout);
+        FLASHMOE_CHECK_CUDA(cudaMallocAsync(&book, sizeof(BookType) * book_b4lt, flashmoeStream));
         FLASHMOE_CHECK_CUDA(cudaMallocAsync(&bookElement, sizeof(ACC::Element) * Bookkeeping::xMlt(ePgD.nLx, ePgD.epWorld), flashmoeStream));
         // Initialize bookkeeping
-        FLASHMOE_CHECK_CUDA(cudaMemsetAsync(book, 0, sizeof(BookType) * Bookkeeping::b4lt(ePgD.nLx, ePgD.epWorld),
-            flashmoeStream));
+        FLASHMOE_CHECK_CUDA(cudaMemsetAsync(book, 0, sizeof(BookType) * book_b4lt, flashmoeStream));
         FLASHMOE_CHECK_CUDA(cudaMemsetAsync(bookTQS, 0, sizeof(TQSignal) * Bookkeeping::pDBlt(), flashmoeStream));
         FLASHMOE_CHECK_CUDA(cudaMemsetAsync(bookRSP, 0, sizeof(RingSoftmaxPayload) * Bookkeeping::rSlt(), flashmoeStream));
         FLASHMOE_CHECK_CUDA(cudaMemsetAsync(bookRTP, 0, sizeof(RingTopKPayload) * Bookkeeping::rTlt(), flashmoeStream));
@@ -411,6 +415,26 @@ namespace flashmoe{
             bookElement,
             ePgD
         };
+        
+        // check buffer layout mismatch
+        {
+            constexpr auto debug_blocks = ACC::PeakHardware::OS::processorBlocks::value;
+            const auto debug_gtQCl = ePgD.epWorld * ePgD.nLx * ACC::TCM::value;
+            const auto debug_static_ilt = 1 + 1 + ePgD.nLx + debug_blocks + 2 * (debug_gtQCl + ACC::E::value) +
+                ACC::E::value * ACC::TCM::value * ACC::TNx::value;
+            const auto layout_gBp = hostBookkeeping.ilt;
+            const auto layout_tQH = 1 + 1 + ePgD.nLx + ACC::E::value * ACC::TCM::value * ACC::TNx::value;
+            printf("DEBUG: Layout detail - gBp_off=%lu, tQH_off=%lu, diff=%ld, gBz=%u, gtQCl=%u\n",
+                   layout_gBp, layout_tQH,
+                   static_cast<long>(layout_tQH) - static_cast<long>(layout_gBp),
+                   Bookkeeping::gBz(),
+                   hostBookkeeping.gtQCl);
+            
+            printf("DEBUG: Buffer layout - allocated_b4lt=%lu, instance_ilt=%lu, static_ilt=%lu\n",
+                   book_b4lt, hostBookkeeping.ilt, debug_static_ilt);
+            fflush(stdout);
+        }
+        
         // copy device-wide barrier
         const auto hB = new cuda::barrier<cuda::thread_scope_device>{blocks};
         FLASHMOE_CHECK_CUDA(cudaMemcpyAsync(hostBookkeeping.dB(), hB,

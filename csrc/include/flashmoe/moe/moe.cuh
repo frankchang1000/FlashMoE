@@ -47,6 +47,19 @@ namespace flashmoe::moe{
             }
         }
         if constexpr (jT == JobType::training) {
+            if (!idx) {
+                const auto* gBase = reinterpret_cast<const BookType*>(gBp);
+                const auto* tQHBase = bookkeeping.tQH();
+                const auto diffEntries =
+                    static_cast<long>(tQHBase - gBase);
+                printf("DEBUG: clearState layout gBase=%p tQH=%p diff=%ld entries (gBz=%u gtQCl=%u)\n",
+                       gBase,
+                       tQHBase,
+                       diffEntries,
+                       Bookkeeping::gBz(),
+                       bookkeeping.gtQCl);
+            }
+            __syncthreads();
             // clear loss buffers
             for (uint i = idx; i < gBz; i += blocks * threads) {
                 gBp[i] = 0.0f;
