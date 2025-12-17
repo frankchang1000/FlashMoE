@@ -273,6 +273,12 @@ namespace flashmoe{
     };
 
     __device__
+    enum class JobMode : uint8_t {
+        forward,
+        gradient
+    };
+
+    __device__
     enum SchedulerConstants : uint {
         interruptSignal = 0,
         tQHeadGroundState = 0

@@ -92,22 +92,33 @@ namespace flashmoe::subscriber{
             /// Flags has dimension [W, L], where W is expert parallel world and L is number of local experts
             constexpr packet::Decoder<PacketStage::initial, PeerConnectivity::p2p, Element> fPd{};
             constexpr packet::Decoder<PacketStage::initial, PeerConnectivity::remote, Element> fRd{};
+            constexpr packet::Decoder<PacketStage::initial, PeerConnectivity::p2p, Element,
+                JobMode::gradient> gPd{};
+            constexpr packet::Decoder<PacketStage::initial, PeerConnectivity::remote, Element,
+                JobMode::gradient> gRd{};
             constexpr auto bSw = sizeof(uint) * 8U;
             const auto laneId = tIdx % WARP_SIZE;
             const auto warpId = tIdx / WARP_SIZE;
+            constexpr uint16_t gradStart = static_cast<uint16_t>(SignalConstants::gradSequenceStart);
+            constexpr uint16_t gradEnd = gradStart + 2;
+            constexpr uint forwardDecode = 1U;
+            constexpr uint gradientDecode = 2U;
             #pragma unroll 2
             for (uint i = 0; i < stageLength; ++i) {
                 const auto vSIdx = i / bSw;
                 const auto vIdx = i % bSw;
                 const auto flagIdx = warpId + i * sNW;
                 ull_t signal = SignalConstants::ground;
+                uint decodeMode = 0U;
                 if (!laneId) {
                     auto visitedSet = bitSet[warpId + vSIdx * sNW];
                     if (!visitedSet.get(vIdx)) {
                         signal = atomicExch_system(CAST_TO(ull_t, flags + flagIdx),
                             SignalConstants::ground);
                         const auto* __restrict__ sP = CONST_CAST_TO(SignalPayload<PacketStage::initial>, &signal);
-                        if (sP->seqBit == localSeqBit) {
+                        const bool isGradientPacket = sP->seqBit >= gradStart && sP->seqBit <= gradEnd;
+                        if (isGradientPacket || sP->seqBit == localSeqBit) {
+                            decodeMode = isGradientPacket ? gradientDecode : forwardDecode;
                             // set visited bit
                             visitedSet.set(vIdx);
                         }
@@ -139,9 +150,11 @@ namespace flashmoe::subscriber{
                 }
                 // broadcast received signal from leader to others
                 signal = __shfl_sync(0xffffffff, signal, 0);
+                decodeMode = __shfl_sync(0xffffffff, decodeMode, 0);
                 const auto* __restrict__ sP = CONST_CAST_TO(SignalPayload<PacketStage::initial>, &signal);
-                if (sP->seqBit == localSeqBit) {
+                if (decodeMode) {
                     stagePending -= 1;
+                    const auto isGradientPacket = decodeMode == gradientDecode;
                     const auto myLocalExIdx = flagIdx % nLx;
                     const auto peerIdx = flagIdx / nLx;
                     const auto pLI = pL[peerIdx];
@@ -164,9 +177,16 @@ namespace flashmoe::subscriber{
                         __syncwarp();
                         auto* nFlags = pLI.remoteSFlags + gfSfC +
                             lXI.expertIndex * (ACC::TCM::value * ACC::TNx::value);
-                        fPd(dA, pLI.remoteSHeap, nFlags, packet, sP->routedTokens,
+                        if (isGradientPacket) {
+                            gPd(dA, pLI.remoteSHeap, nFlags, packet, sP->routedTokens,
                                 myLocalExIdx, pGB, weights, bias, peerIdx, pLI.pe,
                                 laneId, ltQHead, tQHead);
+                        }
+                        else {
+                            fPd(dA, pLI.remoteSHeap, nFlags, packet, sP->routedTokens,
+                                myLocalExIdx, pGB, weights, bias, peerIdx, pLI.pe,
+                                laneId, ltQHead, tQHead);
+                        }
                     }
                     else {
                         if (!laneId) {
@@ -176,8 +196,14 @@ namespace flashmoe::subscriber{
                         __syncwarp();
                         auto* nFlags = dA.sFlags + gfSfC +
                                 lXI.expertIndex * (ACC::TCM::value * ACC::TNx::value);
-                        fRd(dA, dA.sHeap, nFlags, packet, sP->routedTokens,
+                        if (isGradientPacket) {
+                            gRd(dA, dA.sHeap, nFlags, packet, sP->routedTokens,
                                 myLocalExIdx, pGB, weights, bias, peerIdx, pLI.pe, laneId, ltQHead, tQHead);
+                        }
+                        else {
+                            fRd(dA, dA.sHeap, nFlags, packet, sP->routedTokens,
+                                myLocalExIdx, pGB, weights, bias, peerIdx, pLI.pe, laneId, ltQHead, tQHead);
+                        }
                     }
                 }
             }
@@ -219,6 +245,12 @@ namespace flashmoe::subscriber{
             static_assert(WorkSet::kElements == 16 || WorkSet::kElements % bSw == 0);
             constexpr packet::Decoder<PacketStage::last, PeerConnectivity::p2p> lPd{};
             constexpr packet::Decoder<PacketStage::last, PeerConnectivity::remote> lRd{};
+            constexpr packet::Decoder<PacketStage::last, PeerConnectivity::p2p, void,
+                JobMode::gradient> gLPd{};
+            constexpr packet::Decoder<PacketStage::last, PeerConnectivity::remote, void,
+                JobMode::gradient> gLRd{};
+            constexpr uint16_t gradStart = static_cast<uint16_t>(SignalConstants::gradSequenceStart);
+            constexpr uint16_t gradEnd = gradStart + 2;
             // prefetch
             if (stageTrips) {
                 // global -> shared
@@ -248,7 +280,8 @@ namespace flashmoe::subscriber{
                         const auto signal = atomicExch_system(CAST_TO(ull_t, flags + flagIdx),
                             SignalConstants::ground);
                         const auto* __restrict__ sP = CONST_CAST_TO(SignalPayload<PacketStage::last>, &signal);
-                        if (sP->seqBit == localSeqBit) {
+                        const bool isGradientPacket = sP->seqBit >= gradStart && sP->seqBit <= gradEnd;
+                        if (isGradientPacket || sP->seqBit == localSeqBit) {
                             // let's decode this packet
                             // set visited bit
                             sBS.set(bIdx);
@@ -261,14 +294,26 @@ namespace flashmoe::subscriber{
                             if (lookup.isRemote) {
                                 // enforce memory consistency
                                 eMC(sSeqBit, localSeqBit);
-                                lRd(dA, packet, CONST_CAST_TO(cuda::std::byte, tI), sP->tokensM,
-                                    ltQHead, tQHead, expertIdx);
+                                if (isGradientPacket) {
+                                    gLRd(dA, packet, CONST_CAST_TO(cuda::std::byte, tI), sP->tokensM,
+                                        ltQHead, tQHead, expertIdx);
+                                }
+                                else {
+                                    lRd(dA, packet, CONST_CAST_TO(cuda::std::byte, tI), sP->tokensM,
+                                        ltQHead, tQHead, expertIdx);
+                                }
                             }
                             else {
                                 // enforce memory consistency
                                 __threadfence_system();
-                                lPd(dA.tQ, ltQHead, packet, CONST_CAST_TO(cuda::std::byte, tI),
-                                    sP->tokensM, flagIdx % TN, tQHead, expertIdx);
+                                if (isGradientPacket) {
+                                    gLPd(dA.tQ, ltQHead, packet, CONST_CAST_TO(cuda::std::byte, tI),
+                                        sP->tokensM, flagIdx % TN, tQHead, expertIdx);
+                                }
+                                else {
+                                    lPd(dA.tQ, ltQHead, packet, CONST_CAST_TO(cuda::std::byte, tI),
+                                        sP->tokensM, flagIdx % TN, tQHead, expertIdx);
+                                }
                             }
                         }
                     }
@@ -298,7 +343,8 @@ namespace flashmoe::subscriber{
                             const auto signal = atomicExch_system(CAST_TO(ull_t, flags + flagIdx),
                                 SignalConstants::ground);
                             const auto* __restrict__ sP = CONST_CAST_TO(SignalPayload<PacketStage::last>, &signal);
-                            if (sP->seqBit == localSeqBit) {
+                            const bool isGradientPacket = sP->seqBit >= gradStart && sP->seqBit <= gradEnd;
+                            if (isGradientPacket || sP->seqBit == localSeqBit) {
                                 // set visited bit
                                 sBS.set(bIdx);
                                 // let's decode this packet
@@ -311,15 +357,28 @@ namespace flashmoe::subscriber{
                                 if (lookup.isRemote) {
                                     // enforce memory consistency
                                     eMC(sSeqBit, localSeqBit);
-                                    lRd(dA, packet, CONST_CAST_TO(cuda::std::byte, tI), sP->tokensM,
-                                        ltQHead, tQHead, expertIdx);
+                                    if (isGradientPacket) {
+                                        gLRd(dA, packet, CONST_CAST_TO(cuda::std::byte, tI), sP->tokensM,
+                                            ltQHead, tQHead, expertIdx);
+                                    }
+                                    else {
+                                        lRd(dA, packet, CONST_CAST_TO(cuda::std::byte, tI), sP->tokensM,
+                                            ltQHead, tQHead, expertIdx);
+                                    }
                                 }
                                 else {
                                     // enforce memory consistency
                                     __threadfence_system();
-                                    lPd(dA.tQ, ltQHead, packet,
-                                        CONST_CAST_TO(cuda::std::byte, tI),
-                                        sP->tokensM, flagIdx % TN, tQHead, expertIdx);
+                                    if (isGradientPacket) {
+                                        gLPd(dA.tQ, ltQHead, packet,
+                                            CONST_CAST_TO(cuda::std::byte, tI),
+                                            sP->tokensM, flagIdx % TN, tQHead, expertIdx);
+                                    }
+                                    else {
+                                        lPd(dA.tQ, ltQHead, packet,
+                                            CONST_CAST_TO(cuda::std::byte, tI),
+                                            sP->tokensM, flagIdx % TN, tQHead, expertIdx);
+                                    }
                                 }
                             }
                         }

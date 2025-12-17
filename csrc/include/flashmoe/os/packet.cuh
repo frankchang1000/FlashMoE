@@ -300,15 +300,22 @@ namespace flashmoe::packet {
         sHeap(_sHeap), tQ(_tQ), sFlags(_flags),
         nLx(bookkeeping.nLx), epRank(bookkeeping.rank) {}
     };
-    /// Decodes a single packet from the initial stage
+    /// Decodes packets emitted by subscribers.
     template<
         PacketStage s,
         PeerConnectivity p,
-        typename Element = void
+        typename Element = void,
+        JobMode m = JobMode::forward
     >
-    struct Decoder {
+    struct Decoder;
+
+    template<
+        PeerConnectivity p,
+        typename Element,
+        JobMode m
+    >
+    struct Decoder<PacketStage::initial, p, Element, m> {
         static_assert(flashmoe::TensorValueType<Element>);
-        static_assert(s == PacketStage::initial);
         __device__ __forceinline__
         void operator()(const DecoderArg& dA,
             cuda::std::byte* const& sHeap,
@@ -324,6 +331,8 @@ namespace flashmoe::packet {
             const uint& laneId,
             unsigned int& lTQHead,
             unsigned int* __restrict__ const& tQHead) const {
+            constexpr auto jobTaskType = m == JobMode::forward ?
+                TaskType::preGEMM : TaskType::gradPreGEMM;
             constexpr auto tN = ACC::TN::value;
             const auto qIdx = DQ::sNext(lTQHead);
             const auto fTilesM = routedTokens / BLOCK_M;
@@ -348,7 +357,7 @@ namespace flashmoe::packet {
                 const auto tileIdx = laneId + i * WARP_SIZE;
                 const auto rowIdx = tileIdx / tN;
                 dA.tQ[DQ::next(qIdx, i)] = Task{
-                    TaskType::preGEMM,
+                    jobTaskType,
                     packet,
                     weights,
                     taskResults,
@@ -370,7 +379,7 @@ namespace flashmoe::packet {
                 for (uint j = 0; j < lS; j++) {
                     const auto tileIdx = fTilesM * tN + laneId + j * WARP_SIZE;
                     dA.tQ[DQ::next(qIdx, fS + j)] = Task{
-                        TaskType::preGEMM,
+                        jobTaskType,
                         packet,
                         weights,
                         taskResults,
@@ -397,9 +406,8 @@ namespace flashmoe::packet {
         }
     };
 
-
-    template<>
-    struct Decoder<PacketStage::last, PeerConnectivity::p2p> {
+    template<typename Element, JobMode m>
+    struct Decoder<PacketStage::last, PeerConnectivity::p2p, Element, m> {
         __device__ __forceinline__
         void operator()(Task* __restrict__ const& tQ,
             unsigned int& lTQHead,
@@ -409,9 +417,10 @@ namespace flashmoe::packet {
             const unsigned int& tileIdx,
             unsigned int* __restrict__ const& tQHead,
             const unsigned int& expertIdx) const {
-            // now let's decode this single tile
+            constexpr auto jobTaskType = m == JobMode::forward ?
+                TaskType::combine : TaskType::gradCombine;
             tQ[DQ::sNext(lTQHead++)] = Task{
-                TaskType::combine,
+                jobTaskType,
                 tokenIndices,
                 cuda::std::array<const cuda::std::byte*, GEMMs>{packet},
                 nTokens,
@@ -419,13 +428,12 @@ namespace flashmoe::packet {
                 expertIdx
             };
             __threadfence();
-            // notifies scheduler of work
             atomicIncrement<cuda::thread_scope_block>(tQHead);
         }
     };
 
-    template<>
-    struct Decoder<PacketStage::last, PeerConnectivity::remote> {
+    template<typename Element, JobMode m>
+    struct Decoder<PacketStage::last, PeerConnectivity::remote, Element, m> {
         __device__ __forceinline__
         void operator()(const DecoderArg& dA,
             const cuda::std::byte* const& packet,
@@ -434,11 +442,13 @@ namespace flashmoe::packet {
             unsigned int& lTQHead,
             unsigned int* __restrict__ const& tQHead,
             const unsigned int& expertIdx) const {
+            constexpr auto jobTaskType = m == JobMode::forward ?
+                TaskType::combine : TaskType::gradCombine;
             const auto qIdx = DQ::sNext(lTQHead);
             constexpr auto tNx = ACC::TNx::value;
             for (uint i = 0; i < tNx; ++i) {
                 dA.tQ[DQ::next(qIdx, i)] = Task{
-                    TaskType::combine,
+                    jobTaskType,
                     tokenIndices,
                     cuda::std::array<const cuda::std::byte*, GEMMs>{packet},
                     nTokens,
@@ -448,7 +458,6 @@ namespace flashmoe::packet {
             }
             lTQHead += tNx;
             __threadfence();
-            // notifies scheduler
             atomicAdd_block(tQHead, tNx);
         }
     };
