@@ -70,6 +70,7 @@ namespace flashmoe::subscriber{
             ExpertsDown const& expertsDown,
             BiasUp const& biasUp,
             BiasDown const& biasDown,
+            const cuda::std::array<const cuda::std::byte*, GEMMs>& savedActivations,
             cuda::std::byte* __restrict__ const& pGB, /*post GEMM buffer*/
             /// Lookup Table
             const PLI* __restrict__ const& pL,
@@ -179,7 +180,7 @@ namespace flashmoe::subscriber{
                             lXI.expertIndex * (ACC::TCM::value * ACC::TNx::value);
                         if (isGradientPacket) {
                             gPd(dA, pLI.remoteSHeap, nFlags, packet, sP->routedTokens,
-                                myLocalExIdx, pGB, weights, bias, peerIdx, pLI.pe,
+                                myLocalExIdx, pGB, weights, savedActivations, peerIdx, pLI.pe,
                                 laneId, ltQHead, tQHead);
                         }
                         else {
@@ -187,8 +188,7 @@ namespace flashmoe::subscriber{
                                 myLocalExIdx, pGB, weights, bias, peerIdx, pLI.pe,
                                 laneId, ltQHead, tQHead);
                         }
-                    }
-                    else {
+                        else {
                         if (!laneId) {
                             sTB(taskCount, status, peerIdx, nLx, sP->totalTilesM);
                             eMC(sSeqBit, localSeqBit);
@@ -198,7 +198,7 @@ namespace flashmoe::subscriber{
                                 lXI.expertIndex * (ACC::TCM::value * ACC::TNx::value);
                         if (isGradientPacket) {
                             gRd(dA, dA.sHeap, nFlags, packet, sP->routedTokens,
-                                myLocalExIdx, pGB, weights, bias, peerIdx, pLI.pe, laneId, ltQHead, tQHead);
+                                myLocalExIdx, pGB, weights, savedActivations, peerIdx, pLI.pe, laneId, ltQHead, tQHead);
                         }
                         else {
                             fRd(dA, dA.sHeap, nFlags, packet, sP->routedTokens,
@@ -415,6 +415,7 @@ namespace flashmoe::subscriber{
         ExpertsDown const& expertsDown,
         BiasUp const& biasUp,
         BiasDown const& biasDown,
+        const cuda::std::array<const cuda::std::byte*, GEMMs>& savedActivations,
         const uint16_t& lSeqBit,
         const uint& tIdx){
         // offset due to warp specialization for the scheduler
@@ -474,6 +475,7 @@ namespace flashmoe::subscriber{
                     expertsDown,
                     biasUp,
                     biasDown,
+                    savedActivations,
                     pGB,
                     pL,
                     lX,

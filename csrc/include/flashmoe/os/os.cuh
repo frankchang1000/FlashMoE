@@ -34,6 +34,7 @@ namespace flashmoe::os {
         ExpertsDown const& expertsDown,
         BiasUp const& biasUp,
         BiasDown const& biasDown,
+        const cuda::std::array<const cuda::std::byte*, GEMMs>& savedActivations,
         const uint16_t& lSeqBit) {
         const auto ssfC = __ldg(bookkeeping.ssFc());
         const auto* __restrict__ eC = bookkeeping.eC();
@@ -211,7 +212,8 @@ namespace flashmoe::os {
             // subscriber
             subscriber::start<wSet>(bitSet, subscriberScratch, sSeqBit + tIdx,
                 interrupt, tQHeads + tIdx, pL, lX, eL, ssfC, status, taskBound,
-                expertsUp, expertsDown, biasUp, biasDown, lSeqBit, tIdx);
+                expertsUp, expertsDown, biasUp, biasDown, savedActivations,
+                lSeqBit, tIdx);
         }
     }
 }

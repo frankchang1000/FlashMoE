@@ -152,7 +152,17 @@ namespace flashmoe::moe{
             processor::start(workspace, gateOutput, moeOutput, sb);
         }
         else {
-            os::start<processors, d>(workspace, expertsUp, expertsDown, biasUp, biasDown, sb);
+            os::start<processors, d>(
+                workspace,
+                expertsUp,
+                expertsDown,
+                biasUp,
+                biasDown,
+                cuda::std::array<const cuda::std::byte*, GEMMs>{
+                    CONST_CAST_TO(cuda::std::byte, biasUp.data().get()),
+                    CONST_CAST_TO(cuda::std::byte, biasDown.data().get())
+                },
+            sb);
         }
     }
 

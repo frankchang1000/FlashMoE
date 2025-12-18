@@ -80,6 +80,19 @@ namespace flashmoe {
         using type = ActivationFunction;
     };
 
+    template<bool isDerivative, typename ActivationOp, typename ElementC>
+    struct activation_epilogue_helper;
+
+    template<typename ActivationOp, typename ElementC>
+    struct activation_epilogue_helper<true, ActivationOp, ElementC> {
+        using type = ActivationOp;
+    };
+
+    template<typename ActivationOp, typename ElementC>
+    struct activation_epilogue_helper<false, ActivationOp, ElementC> {
+        using type = FAA<ElementC, ActivationOp>;
+    };
+
     /// activation deriv: (matmul_result) ⊙ activation'(saved_forward)
     template <typename Element, typename ActivationFunction>
     requires(flashmoe::TensorValueType<Element> && cuda::std::is_invocable_r_v<Element, ActivationFunction, Element>)
@@ -221,11 +234,11 @@ namespace flashmoe {
             typename Parameters::sCopyB,
             cute::identity
         >;
-        using FusedEpilogue = cuda::std::conditional_t<
+        using FusedEpilogue = typename activation_epilogue_helper<
             isActivationDerivative<ActivationOp>::value,
             ActivationOp,
-            FAA<ElementC, ActivationOp>
-        >;
+            ElementC
+        >::type;
     };
 }
 #endif //GEMM_CUH
