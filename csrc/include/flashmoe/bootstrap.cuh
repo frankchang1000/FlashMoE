@@ -376,7 +376,11 @@ namespace flashmoe{
         BookType* book = nullptr;
         cuda::std::byte* bookElement = nullptr;
         Element* gradWeights = nullptr;
-
+        Element* gradGateWeights = nullptr;
+        Element* routingScores = nullptr;
+        Element* gradGateCombine = nullptr;
+        Element* gradGateGEMM = nullptr;
+        
         FLASHMOE_CHECK_CUDA(cudaMallocAsync(&bookTask, sizeof(Task) * Bookkeeping::tQlt(ePgD.nLx, ePgD.epWorld), flashmoeStream));
         FLASHMOE_CHECK_CUDA(cudaMallocAsync(&bookPEL, sizeof(PEL) * ACC::E::value, flashmoeStream));
         FLASHMOE_CHECK_CUDA(cudaMallocAsync(&bookPLI, sizeof(PLI) * ePgD.epWorld, flashmoeStream));
@@ -398,6 +402,22 @@ namespace flashmoe{
         if constexpr (ACC::JT::value == JobType::training) {
             FLASHMOE_CHECK_CUDA(cudaMallocAsync(&gradWeights,
                 sizeof(Element) * Bookkeeping::gWlt(ePgD.nLx), flashmoeStream));
+            FLASHMOE_CHECK_CUDA(cudaMallocAsync(&gradGateWeights,
+                sizeof(Element) * Bookkeeping::gGateWlt(), flashmoeStream));
+            FLASHMOE_CHECK_CUDA(cudaMallocAsync(&routingScores,
+                sizeof(Element) * Bookkeeping::gateRoutingScoresLt(), flashmoeStream));
+            FLASHMOE_CHECK_CUDA(cudaMallocAsync(&gradGateCombine,
+                sizeof(Element) * Bookkeeping::gGateCombineLt(), flashmoeStream));
+            FLASHMOE_CHECK_CUDA(cudaMallocAsync(&gradGateGEMM,
+                sizeof(Element) * Bookkeeping::gGateGEMMLt(), flashmoeStream));
+            printf("DEBUG: training build - allocated grad buffers (bytes) gW=%lu gateW=%lu routing=%lu combine=%lu gemm=%lu\n",
+                sizeof(Element) * Bookkeeping::gWlt(ePgD.nLx),
+                sizeof(Element) * Bookkeeping::gGateWlt(),
+                sizeof(Element) * Bookkeeping::gateRoutingScoresLt(),
+                sizeof(Element) * Bookkeeping::gGateCombineLt(),
+                sizeof(Element) * Bookkeeping::gGateGEMMLt());
+        } else {
+            printf("DEBUG: inference build - grad buffers skipped\n");
         }
         // Initialize bookkeeping
         FLASHMOE_CHECK_CUDA(cudaMemsetAsync(book, 0, sizeof(BookType) * book_b4lt, flashmoeStream));
@@ -407,6 +427,14 @@ namespace flashmoe{
         if constexpr (ACC::JT::value == JobType::training) {
             FLASHMOE_CHECK_CUDA(cudaMemsetAsync(gradWeights, 0,
                 sizeof(Element) * Bookkeeping::gWlt(ePgD.nLx), flashmoeStream));
+            FLASHMOE_CHECK_CUDA(cudaMemsetAsync(gradGateWeights, 0,
+                sizeof(Element) * Bookkeeping::gGateWlt(), flashmoeStream));
+            FLASHMOE_CHECK_CUDA(cudaMemsetAsync(routingScores, 0,
+                sizeof(Element) * Bookkeeping::gateRoutingScoresLt(), flashmoeStream));
+            FLASHMOE_CHECK_CUDA(cudaMemsetAsync(gradGateCombine, 0,
+                sizeof(Element) * Bookkeeping::gGateCombineLt(), flashmoeStream));
+            FLASHMOE_CHECK_CUDA(cudaMemsetAsync(gradGateGEMM, 0,
+                sizeof(Element) * Bookkeeping::gGateGEMMLt(), flashmoeStream));
         }
         hostBookkeeping = Bookkeeping{
             flags,
@@ -423,6 +451,10 @@ namespace flashmoe{
             book,
             bookElement,
             gradWeights,
+            gradGateWeights,
+            routingScores,
+            gradGateCombine,
+            gradGateGEMM,
             ePgD
         };
         
@@ -552,6 +584,10 @@ namespace flashmoe{
         BookType* book = nullptr;
         cuda::std::byte* bookElement = nullptr;
         Element* gradWeights = nullptr;
+        Element* gradGateWeights = nullptr;
+        Element* routingScores = nullptr;
+        Element* gradGateCombine = nullptr;
+        Element* gradGateGEMM = nullptr;
         FLASHMOE_CHECK_CUDA(cudaMallocAsync(&book,
             sizeof(BookType) * Bookkeeping::b4lt(), flashmoeStream));
         FLASHMOE_CHECK_CUDA(cudaMallocAsync(&bookElement,
@@ -559,10 +595,42 @@ namespace flashmoe{
         if constexpr (ACC::JT::value == JobType::training) {
             FLASHMOE_CHECK_CUDA(cudaMallocAsync(&gradWeights,
                 sizeof(Element) * Bookkeeping::gWlt(ACC::E::value), flashmoeStream));
+            FLASHMOE_CHECK_CUDA(cudaMallocAsync(&gradGateWeights,
+                sizeof(Element) * Bookkeeping::gGateWlt(), flashmoeStream));
+            FLASHMOE_CHECK_CUDA(cudaMallocAsync(&routingScores,
+                sizeof(Element) * Bookkeeping::gateRoutingScoresLt(), flashmoeStream));
+            FLASHMOE_CHECK_CUDA(cudaMallocAsync(&gradGateCombine,
+                sizeof(Element) * Bookkeeping::gGateCombineLt(), flashmoeStream));
+            FLASHMOE_CHECK_CUDA(cudaMallocAsync(&gradGateGEMM,
+                sizeof(Element) * Bookkeeping::gGateGEMMLt(), flashmoeStream));
             FLASHMOE_CHECK_CUDA(cudaMemsetAsync(gradWeights, 0,
                 sizeof(Element) * Bookkeeping::gWlt(ACC::E::value), flashmoeStream));
+            FLASHMOE_CHECK_CUDA(cudaMemsetAsync(gradGateWeights, 0,
+                sizeof(Element) * Bookkeeping::gGateWlt(), flashmoeStream));
+            FLASHMOE_CHECK_CUDA(cudaMemsetAsync(routingScores, 0,
+                sizeof(Element) * Bookkeeping::gateRoutingScoresLt(), flashmoeStream));
+            FLASHMOE_CHECK_CUDA(cudaMemsetAsync(gradGateCombine, 0,
+                sizeof(Element) * Bookkeeping::gGateCombineLt(), flashmoeStream));
+            FLASHMOE_CHECK_CUDA(cudaMemsetAsync(gradGateGEMM, 0,
+                sizeof(Element) * Bookkeeping::gGateGEMMLt(), flashmoeStream));
+            printf("DEBUG: training singleton build - allocated grad buffers (bytes) gW=%lu gateW=%lu routing=%lu combine=%lu gemm=%lu\n",
+                sizeof(Element) * Bookkeeping::gWlt(ACC::E::value),
+                sizeof(Element) * Bookkeeping::gGateWlt(),
+                sizeof(Element) * Bookkeeping::gateRoutingScoresLt(),
+                sizeof(Element) * Bookkeeping::gGateCombineLt(),
+                sizeof(Element) * Bookkeeping::gGateGEMMLt());
+        } else {
+            printf("DEBUG: singleton inference build - grad buffers skipped\n");
         }
-        hostBookkeeping = Bookkeeping{book, bookElement, gradWeights};
+        hostBookkeeping = Bookkeeping{
+            book,
+            bookElement,
+            gradWeights,
+            gradGateWeights,
+            routingScores,
+            gradGateCombine,
+            gradGateGEMM
+        };
         FLASHMOE_CHECK_CUDA(cudaMemcpyToSymbolAsync(bookkeeping, &hostBookkeeping,
             sizeof(Bookkeeping), 0,
             cudaMemcpyHostToDevice, flashmoeStream));
@@ -623,6 +691,18 @@ namespace flashmoe{
         if constexpr (ACC::JT::value == JobType::training) {
             if (hostBookkeeping.gradWeights != nullptr) {
                 FLASHMOE_CHECK_CUDA(cudaFreeAsync(hostBookkeeping.gradWeights, flashmoeStream));
+            }
+            if (hostBookkeeping.gradGateWeights != nullptr) {
+                FLASHMOE_CHECK_CUDA(cudaFreeAsync(hostBookkeeping.gradGateWeights, flashmoeStream));
+            }
+            if (hostBookkeeping.routingScores != nullptr) {
+                FLASHMOE_CHECK_CUDA(cudaFreeAsync(hostBookkeeping.routingScores, flashmoeStream));
+            }
+            if (hostBookkeeping.gradGateCombine != nullptr) {
+                FLASHMOE_CHECK_CUDA(cudaFreeAsync(hostBookkeeping.gradGateCombine, flashmoeStream));
+            }
+            if (hostBookkeeping.gradGateGEMM != nullptr) {
+                FLASHMOE_CHECK_CUDA(cudaFreeAsync(hostBookkeeping.gradGateGEMM, flashmoeStream));
             }
         }
         // Below ensures all work is done before deallocating via the external API

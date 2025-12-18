@@ -555,7 +555,9 @@ namespace flashmoe{
         gradPreGEMM,     // grad_output * W2^T -> grad_intermediate
         gradPostGEMM,    // grad_intermediate * W1^T -> grad_input
         gradWeights,     // compute weight gradients
-        gradCombine      // distribute gradients to experts
+        gradCombine,     // distribute gradients to experts
+        gradGateCombine, // routing gradient aggregation
+        gradGateGEMM     // gate weight and input gradients
     };
 
     enum class EP {
@@ -726,6 +728,10 @@ namespace flashmoe{
         BookType* book = nullptr;
         cuda::std::byte* bookElement = nullptr;
         ACC::Element* gradWeights = nullptr;
+        ACC::Element* gradGateWeights = nullptr;
+        ACC::Element* routingScores = nullptr;
+        ACC::Element* gradGateCombine = nullptr;
+        ACC::Element* gradGateGEMM = nullptr;
         unsigned long int ilt = 0U;
         unsigned int gtQCl = 0U;
         unsigned int sT = 0U;
@@ -757,6 +763,10 @@ namespace flashmoe{
             BookType* const& _book,
             cuda::std::byte* const& _bookElement,
             ACC::Element* const& _gradWeights,
+            ACC::Element* const& _gradGateWeights,
+            ACC::Element* const& _routingScores,
+            ACC::Element* const& _gradGateCombine,
+            ACC::Element* const& _gradGateGEMM,
             const EPG& ePgD) :
                 flags(_flags),
                 sHeap(_sHeap),
@@ -772,6 +782,10 @@ namespace flashmoe{
                 book(_book),
                 bookElement(_bookElement),
                 gradWeights(_gradWeights),
+                gradGateWeights(_gradGateWeights),
+                routingScores(_routingScores),
+                gradGateCombine(_gradGateCombine),
+                gradGateGEMM(_gradGateGEMM),
                 rank(ePgD.epRank),
                 world(ePgD.epWorld),
                 nLx(ePgD.nLx),
@@ -795,8 +809,14 @@ namespace flashmoe{
         }
 
         Bookkeeping(BookType* const& _book, cuda::std::byte* const& _bookElement,
-            ACC::Element* const& _gradWeights = nullptr) :
-        book(_book), bookElement(_bookElement), gradWeights(_gradWeights){}
+            ACC::Element* const& _gradWeights = nullptr,
+            ACC::Element* const& _gradGateWeights = nullptr,
+            ACC::Element* const& _routingScores = nullptr,
+            ACC::Element* const& _gradGateCombine = nullptr,
+            ACC::Element* const& _gradGateGEMM = nullptr) :
+        book(_book), bookElement(_bookElement), gradWeights(_gradWeights),
+        gradGateWeights(_gradGateWeights), routingScores(_routingScores),
+        gradGateCombine(_gradGateCombine), gradGateGEMM(_gradGateGEMM){}
 
         template<unsigned int tileDimension>
         __host__ __device__ __forceinline__
@@ -984,6 +1004,34 @@ namespace flashmoe{
         }
         constexpr static auto gWlt(const unsigned int& _nLx) {
             return (2 * ACC::P::value * ACC::H::value + ACC::P::value + ACC::H::value) * _nLx;
+        }
+        __device__ __forceinline__
+        auto* gGateW() const {
+            return gradGateWeights;
+        }
+        constexpr static auto gGateWlt() {
+            return ACC::H::value * ACC::E::value;
+        }
+        __device__ __forceinline__
+        auto* gateRoutingScores() const {
+            return routingScores;
+        }
+        constexpr static auto gateRoutingScoresLt() {
+            return ACC::S::value * ACC::E::value;
+        }
+        __device__ __forceinline__
+        auto* gGateCombine() const {
+            return gradGateCombine;
+        }
+        constexpr static auto gGateCombineLt() {
+            return ACC::S::value * ACC::E::value;
+        }
+        __device__ __forceinline__
+        auto* gGateGEMM() const {
+            return gradGateGEMM;
+        }
+        constexpr static auto gGateGEMMLt() {
+            return ACC::S::value * ACC::E::value;
         }
         /***********CONTIGUOUS**************/
         constexpr static auto b4lt(const unsigned int& _nLx, const unsigned int& _world) {

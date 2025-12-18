@@ -188,7 +188,8 @@ namespace flashmoe::subscriber{
                                 myLocalExIdx, pGB, weights, bias, peerIdx, pLI.pe,
                                 laneId, ltQHead, tQHead);
                         }
-                        else {
+                    }
+                    else {
                         if (!laneId) {
                             sTB(taskCount, status, peerIdx, nLx, sP->totalTilesM);
                             eMC(sSeqBit, localSeqBit);
