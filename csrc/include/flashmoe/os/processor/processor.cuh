@@ -965,6 +965,53 @@ namespace flashmoe::processor{
     }
 
     template<
+        unsigned int K = ACC::P::value,
+        unsigned int N = ACC::H::value,
+        typename Element,
+        unsigned int elems = ACC::Elems::value,
+        unsigned int threads = ACC::PeakHardware::OS::threads::value
+    >
+    requires(TensorValueType<Element>)
+    __device__ __forceinline__
+    void computeWeightGradients(cuda::std::byte* __restrict__ const& workspace,
+            const Element* __restrict__ const& activations,
+            const Element* __restrict__ const& gradients,
+            Element* __restrict__ const& weightGradBuffer,
+            const uint16_t& tileSize,
+            const uint16_t& expertIdx) {
+        constexpr auto bM = BLOCK_M;
+
+        const auto mAct = make_tensor(cute::make_gmem_ptr(activations),
+            cute::Layout<cute::Shape<cute::Int<bM>, cute::Int<K>>,
+                cute::Stride<cute::Int<K>, cute::_1>>{});
+        const auto mGrad = make_tensor(cute::make_gmem_ptr(gradients),
+            cute::Layout<cute::Shape<cute::Int<bM>, cute::Int<N>>,
+                cute::Stride<cute::Int<N>, cute::_1>>{});
+        const auto mWGrad = make_tensor(cute::make_gmem_ptr(weightGradBuffer),
+            cute::Layout<cute::Shape<cute::Int<K>, cute::Int<N>>,
+                cute::Stride<cute::Int<N>, cute::_1>>{});
+
+        #pragma unroll
+        for (uint m = 0; m < bM; ++m) {
+            if (m < tileSize) {
+                #pragma unroll
+                for (uint k = 0; k < K; ++k) {
+                    const auto actVal = mAct(m, k);
+                    #pragma unroll
+                    for (uint n = 0; n < N; ++n) {
+                        const auto gradVal = mGrad(m, n);
+                        using ProdT = decltype(actVal * gradVal);
+                        using NativeElement = typename ToCDx<Element>::T;
+                        constexpr auto convert = cutlass::NumericConverter<NativeElement, ProdT>{};
+                        auto* nativePtr = CAST_TO(NativeElement, &mWGrad(k, n));
+                        atomicAdd(nativePtr, convert(actVal * gradVal));
+                    }
+                }
+            }
+        }
+    }
+
+    template<
         typename ScaleWeights,
         typename Output
     >
@@ -1003,6 +1050,7 @@ namespace flashmoe::processor{
         using GradPreGEMM = BlockMM<flashmoe::ActivationDerivative<ACC::ElementC, ACC::ActivationOp>, Element>;
         using GradPostGEMM = BlockMM<flashmoe::ActivationDerivative<ACC::ElementC, ACC::ActivationOpX>, Element>;
         constexpr uint H = ACC::H::value;
+        constexpr uint P = ACC::P::value;
         constexpr auto tN = ACC::TN::value;
         constexpr auto tNx = ACC::TNx::value;
         __syncthreads();
@@ -1111,6 +1159,113 @@ namespace flashmoe::processor{
                             moeOutput.data().get(),
                             sW,
                             rCurrentTask.tileIdx,
+                            rCurrentTask.tileSize,
+                            rCurrentTask.expertIdx);
+                    }
+                    break;
+                    case TaskType::gradCombine: {
+                        constexpr unsigned int gradIndex = 0;
+                        splitGradients<ACC::CM::value>(
+                            workspace,
+                            CONST_CAST_TO(TPS, rCurrentTask.aData),
+                            CONST_CAST_TO(typename PostGEMM::MatrixAType, rCurrentTask.bData[gradIndex]),
+                            CAST_TO(Element, rCurrentTask.cData[gradIndex]),
+                            sW,
+                            rCurrentTask.tileIdx,
+                            rCurrentTask.tileSize,
+                            rCurrentTask.expertIdx);
+                        __syncthreads();
+                        if (!threadIdx.x) {
+                            __threadfence();
+                            enqueue = atomicAdd(pA.tQS + rCurrentTask.syncIdx, 1U) + 1 == tNx;
+                        }
+                        __syncthreads();
+                        if (enqueue) {
+                            if (!rCurrentTask.isPeerRemote) {
+                                notifyGradient<PeerConnectivity::p2p>(CAST_TO(uint, workspace), rCurrentTask, pA);
+                            }
+                            else {
+                                notifyGradient<PeerConnectivity::remote>(CAST_TO(uint, workspace), rCurrentTask, pA);
+                            }
+                        }
+                    }
+                    break;
+                    case TaskType::gradPostGEMM: {
+                        constexpr unsigned int w2Index = 1;
+                        fGET<GradPostGEMM, ACC::H::value, ACC::P::value>(
+                            CAST_TO(typename GradPostGEMM::MatrixDType, workspace),
+                            CONST_CAST_TO(typename GradPostGEMM::MatrixAType, rCurrentTask.aData),
+                            CONST_CAST_TO(typename GradPostGEMM::MatrixBType, rCurrentTask.bData[w2Index]),
+                            CAST_TO(typename GradPostGEMM::MatrixDType, rCurrentTask.cData[w2Index]),
+                            CONST_CAST_TO(typename GradPostGEMM::MatrixDType, rCurrentTask.dData[w2Index]),
+                            rCurrentTask.M,
+                            rCurrentTask.tileIdx);
+                        __syncthreads();
+                        if (!threadIdx.x) {
+                            const auto flagSignal = SignalPayload<PacketStage::last>{
+                                rCurrentTask.batchIdx,
+                                rCurrentTask.tileSize,
+                                rSeqBit,
+                            };
+                            if (rCurrentTask.isPeerRemote) {
+                                __threadfence();
+                                if (atomicIncrement(pA.tQS + rCurrentTask.syncIdx) + 1 == tN + tNx) {
+                                    nvshmem_putmem_signal_nbi(rCurrentTask.rcData,
+                                        rCurrentTask.cData[w2Index],
+                                        rCurrentTask.tileSize * H * sizeof(Element),
+                                        rCurrentTask.flags,
+                                        *CONST_CAST_TO(flagsType, &flagSignal), NVSHMEM_SIGNAL_SET,
+                                        rCurrentTask.peerIdx);
+                                }
+                            }
+                            else {
+                                __threadfence_system();
+                                atomicExch_system(CAST_TO(ull_t, rCurrentTask.flags),
+                                    *CONST_CAST_TO(ull_t, &flagSignal));
+                            }
+                        }
+                    }
+                    break;
+                    case TaskType::gradPreGEMM: {
+                        constexpr unsigned int w1Index = 0;
+                        fGET<GradPreGEMM, ACC::P::value, ACC::H::value>(
+                            CAST_TO(typename GradPreGEMM::MatrixDType, workspace),
+                            CONST_CAST_TO(typename GradPreGEMM::MatrixAType, rCurrentTask.aData),
+                            CONST_CAST_TO(typename GradPreGEMM::MatrixBType, rCurrentTask.bData[w1Index]),
+                            CAST_TO(typename GradPreGEMM::MatrixDType, rCurrentTask.cData[w1Index]),
+                            CONST_CAST_TO(typename GradPreGEMM::MatrixDType, rCurrentTask.dData[w1Index]),
+                            rCurrentTask.M,
+                            rCurrentTask.tileIdx);
+                        __syncthreads();
+                        if (!threadIdx.x) {
+                            constexpr auto expertStride = 2 * P * H + P + H;
+                            auto* const weightGradBuffer = CAST_TO(Element, bookkeeping.gW()) + rCurrentTask.expertIdx * expertStride;
+                            const auto gradWeightTask = Task{
+                                TaskType::gradWeights,
+                                rCurrentTask.aData,
+                                rCurrentTask.bData,
+                                rCurrentTask.cData,
+                                rCurrentTask.dData,
+                                CAST_TO(cuda::std::byte, weightGradBuffer),
+                                rCurrentTask.flags,
+                                rCurrentTask.syncIdx,
+                                rCurrentTask.tileIdx,
+                                rCurrentTask.M,
+                                rCurrentTask.tileSize,
+                                rCurrentTask.peerIdx,
+                                rCurrentTask.batchIdx,
+                                rCurrentTask.isPeerRemote,
+                            };
+                            enqueueTask(gradWeightTask, pA);
+                        }
+                    }
+                    break;
+                    case TaskType::gradWeights: {
+                        computeWeightGradients<ACC::P::value, ACC::H::value>(
+                            workspace,
+                            CONST_CAST_TO(typename PreGEMM::MatrixAType, rCurrentTask.aData),
+                            CONST_CAST_TO(typename PostGEMM::MatrixAType, rCurrentTask.cData[0]),
+                            CAST_TO(Element, rCurrentTask.rcData),
                             rCurrentTask.tileSize,
                             rCurrentTask.expertIdx);
                     }
