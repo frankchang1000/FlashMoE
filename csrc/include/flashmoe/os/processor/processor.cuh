@@ -14,10 +14,16 @@
 
 #include <cutlass/array.h>
 #include <cute/tensor.hpp>
+#include <cuda/std/limits>
 #include <nvshmem.h>
 
 #include "gemm.cuh"
 #include "../../types.cuh"
+
+namespace flashmoe::moe {
+    extern __device__ const ACC::Element* hiddenStatesPtr;
+    extern __device__ const ACC::Element* gateWeightsPtr;
+}
 
 namespace flashmoe::processor{
     enum class ReleaseType {
@@ -820,12 +826,11 @@ namespace flashmoe::processor{
         }
     }
 
-    template<
+    template<TaskType TaskT,
         PeerConnectivity p,
-        unsigned int tasks = ACC::TNx::value
-    >
+        unsigned int tasks = ACC::TNx::value>
     __device__ __forceinline__
-    void notifyGradient(uint* __restrict__ const& workspace, const Task& rCurrentTask, const ProcessorArgs& pA) {
+    void notifyGradientImpl(uint* __restrict__ const& workspace, const Task& rCurrentTask, const ProcessorArgs& pA) {
         static_assert(sizeof(Task) == 128);
         constexpr auto eS = sizeof(Task) / sizeof(uint);
         static_assert(eS == WARP_SIZE);
@@ -856,7 +861,7 @@ namespace flashmoe::processor{
                 const auto taskIdx = threadIdx.x + i * capacity;
                 const auto tileIdx = offset + taskIdx;
                 const auto nextTask = Task {
-                    TaskType::gradPostGEMM,
+                    TaskT,
                     rCurrentTask.cData[gradIndex],
                     rCurrentTask.bData,
                     rCurrentTask.cData,
@@ -890,7 +895,7 @@ namespace flashmoe::processor{
                 const auto taskIdx = threadIdx.x + trips * capacity;
                 const auto tileIdx = offset + taskIdx;
                 const auto nextTask = Task {
-                    TaskType::gradPostGEMM,
+                    TaskT,
                     rCurrentTask.cData[gradIndex],
                     rCurrentTask.bData,
                     rCurrentTask.cData,
@@ -934,6 +939,24 @@ namespace flashmoe::processor{
             __threadfence();
             atomicAdd(pA.tQH + rCurrentTask.syncIdx, tasks);
         }
+    }
+
+    template<
+        PeerConnectivity p,
+        unsigned int tasks = ACC::TNx::value
+    >
+    __device__ __forceinline__
+    void notifyGradient(uint* __restrict__ const& workspace, const Task& rCurrentTask, const ProcessorArgs& pA) {
+        notifyGradientImpl<TaskType::gradPostGEMM, p, tasks>(workspace, rCurrentTask, pA);
+    }
+
+    template<
+        PeerConnectivity p,
+        unsigned int tasks = ACC::TNx::value
+    >
+    __device__ __forceinline__
+    void notifyGateGradient(uint* __restrict__ const& workspace, const Task& rCurrentTask, const ProcessorArgs& pA) {
+        notifyGradientImpl<TaskType::gradGateGEMM, p, tasks>(workspace, rCurrentTask, pA);
     }
 
     __device__ __forceinline__
@@ -1186,6 +1209,160 @@ namespace flashmoe::processor{
                             }
                             else {
                                 notifyGradient<PeerConnectivity::remote>(CAST_TO(uint, workspace), rCurrentTask, pA);
+                            }
+                        }
+                    }
+                    break;
+                    case TaskType::gradGateCombine: {
+                        constexpr unsigned int gradIndex = 0;
+                        using ComputeElement = ACC::ElementC;
+                        constexpr auto H = ACC::H::value;
+                        constexpr auto E = ACC::E::value;
+                        constexpr auto S = ACC::S::value;
+                        constexpr auto blockTokens = BLOCK_M;
+                        const auto tileSize = rCurrentTask.tileSize;
+                        const auto baseToken = static_cast<unsigned int>(rCurrentTask.tileIdx) * blockTokens;
+                        const auto safeBaseToken = baseToken < S ? baseToken :
+                            (S > blockTokens ? S - blockTokens : 0U);
+                        const auto* __restrict__ const gradOut = CONST_CAST_TO(typename PostGEMM::MatrixAType, rCurrentTask.cData[gradIndex]);
+                        const auto mGradOut = make_tensor(cute::make_gmem_ptr(gradOut),
+                            cute::Layout<cute::Shape<cute::Int<S>, cute::Int<H>>,
+                                cute::Stride<cute::Int<H>, cute::_1>>{});
+                        auto* __restrict__ const gateBuffer = bookkeeping.gGateCombine();
+                        auto* __restrict__ const tokenIds = CONST_CAST_TO(TPS, rCurrentTask.aData);
+                        auto* __restrict__ const tileGateBuffer = gateBuffer + safeBaseToken * E;
+                        constexpr auto threads = ACC::PeakHardware::OS::threads::value;
+                        constexpr auto convertProb = cutlass::NumericConverter<Element, mp_t>{};
+                        constexpr auto toCompute = cutlass::NumericConverter<ComputeElement, Element>{};
+                        constexpr auto toElement = cutlass::NumericConverter<Element, ComputeElement>{};
+                        using NativeElement = typename ToCDx<Element>::T;
+                        constexpr auto convertNative = cutlass::NumericConverter<NativeElement, Element>{};
+                        if (!threadIdx.x) {
+                            const auto tileEntries = static_cast<unsigned int>(tileSize) * E;
+                            #pragma unroll 4
+                            for (uint i = 0; i < tileEntries; ++i) {
+                                tileGateBuffer[i] = Element(0);
+                            }
+                        }
+                        __syncthreads();
+
+                        for (uint idx = threadIdx.x; idx < tileSize; idx += threads) {
+                            const auto tokenEntry = tokenIds[idx];
+                            const auto tokenIdx = tokenEntry.tokenIdx;
+                            if (tokenIdx >= S) {
+                                continue;
+                            }
+                            ComputeElement gradSum = ComputeElement(0);
+                            #pragma unroll
+                            for (uint n = 0; n < H; ++n) {
+                                gradSum = fmaf(toCompute(mGradOut(tokenIdx, n)), ComputeElement(1), gradSum);
+                            }
+                            const auto probVal = convertProb(tokenEntry.probability);
+                            const auto routingVal = probVal * toElement(gradSum);
+                            auto* const slot = tileGateBuffer + idx * E + rCurrentTask.expertIdx;
+                            atomicAdd(CAST_TO(NativeElement, slot), convertNative(routingVal));
+                        }
+                        __syncthreads();
+                        if (!threadIdx.x) {
+                            rCurrentTask.cData[gradIndex] = CAST_TO(cuda::std::byte, tileGateBuffer);
+                            rCurrentTask.bData[0] = CONST_CAST_TO(cuda::std::byte, flashmoe::moe::hiddenStatesPtr);
+                            rCurrentTask.bData[1] = CONST_CAST_TO(cuda::std::byte, flashmoe::moe::gateWeightsPtr);
+                            __threadfence();
+                            enqueue = atomicAdd(pA.tQS + rCurrentTask.syncIdx, 1U) + 1 == tNx;
+                        }
+                        __syncthreads();
+                        if (enqueue) {
+                            if (!rCurrentTask.isPeerRemote) {
+                                notifyGateGradient<PeerConnectivity::p2p>(CAST_TO(uint, workspace), rCurrentTask, pA);
+                            }
+                            else {
+                                notifyGateGradient<PeerConnectivity::remote>(CAST_TO(uint, workspace), rCurrentTask, pA);
+                            }
+                        }
+                    }
+                    break;
+                    case TaskType::gradGateGEMM: {
+                        constexpr auto H = ACC::H::value;
+                        constexpr auto E = ACC::E::value;
+                        constexpr auto S = ACC::S::value;
+                        constexpr auto blockTokens = BLOCK_M;
+                        const auto tileSize = rCurrentTask.tileSize;
+                        const auto baseToken = static_cast<unsigned int>(rCurrentTask.tileIdx) * blockTokens;
+                        const auto safeBaseToken = baseToken < S ? baseToken :
+                            (S > blockTokens ? S - blockTokens : 0U);
+                        const auto* __restrict__ const hiddenStates = CONST_CAST_TO(Element, rCurrentTask.bData[0]);
+                        const auto* __restrict__ const gateWeights = CONST_CAST_TO(Element, rCurrentTask.bData[1]);
+                        const auto* __restrict__ const gradRouting = CONST_CAST_TO(Element, rCurrentTask.cData[0]);
+                        auto* __restrict__ const gradInput = const_cast<Element*>(CONST_CAST_TO(Element, rCurrentTask.dData[0]));
+                        auto* __restrict__ const routingScores = bookkeeping.gateRoutingScores();
+                        auto* __restrict__ const gateWeightGrad = bookkeeping.gGateW();
+                        constexpr auto threads = ACC::PeakHardware::OS::threads::value;
+                        constexpr auto toCompute = cutlass::NumericConverter<ACC::ElementC, Element>{};
+                        constexpr auto toElement = cutlass::NumericConverter<Element, ACC::ElementC>{};
+                        using NativeElement = typename ToCDx<Element>::T;
+                        constexpr auto convertNative = cutlass::NumericConverter<NativeElement, Element>{};
+
+                        for (uint t = threadIdx.x; t < tileSize; t += threads) {
+                            const auto tokenIdx = safeBaseToken + t;
+                            if (tokenIdx >= S) {
+                                continue;
+                            }
+                            const auto* __restrict__ const gradRoutingRow = gradRouting + t * E;
+                            const auto* __restrict__ const scoreRow = routingScores + tokenIdx * E;
+                            ACC::ElementC maxScore = -cuda::std::numeric_limits<ACC::ElementC>::infinity();
+                            ACC::ElementC expRow[E];
+                            #pragma unroll
+                            for (uint e = 0; e < E; ++e) {
+                                const auto val = toCompute(scoreRow[e]);
+                                if (val > maxScore) {
+                                    maxScore = val;
+                                }
+                                expRow[e] = val;
+                            }
+                            ACC::ElementC sumExp = ACC::ElementC(0);
+                            #pragma unroll
+                            for (uint e = 0; e < E; ++e) {
+                                expRow[e] = __expf(expRow[e] - maxScore);
+                                sumExp = fmaf(expRow[e], ACC::ElementC(1), sumExp);
+                            }
+                            if (sumExp == ACC::ElementC(0)) {
+                                sumExp = ACC::ElementC(1);
+                            }
+                            ACC::ElementC softmaxRow[E];
+                            #pragma unroll
+                            for (uint e = 0; e < E; ++e) {
+                                softmaxRow[e] = expRow[e] / sumExp;
+                            }
+                            ACC::ElementC dot = ACC::ElementC(0);
+                            #pragma unroll
+                            for (uint e = 0; e < E; ++e) {
+                                dot = fmaf(softmaxRow[e], toCompute(gradRoutingRow[e]), dot);
+                            }
+                            ACC::ElementC gradRoutingSoftmax[E];
+                            #pragma unroll
+                            for (uint e = 0; e < E; ++e) {
+                                gradRoutingSoftmax[e] = softmaxRow[e] * (toCompute(gradRoutingRow[e]) - dot);
+                            }
+                            const auto* __restrict__ const hiddenRow = hiddenStates + t * H;
+                            auto* __restrict__ const inputRow = gradInput + t * H;
+                            #pragma unroll
+                            for (uint h = 0; h < H; ++h) {
+                                const auto hiddenVal = toCompute(hiddenRow[h]);
+                                #pragma unroll
+                                for (uint e = 0; e < E; ++e) {
+                                    const auto product = hiddenVal * gradRoutingSoftmax[e];
+                                    const auto productElem = toElement(product);
+                                    auto* const gradWeightPtr = gateWeightGrad + h * E + e;
+                                    atomicAdd(CAST_TO(NativeElement, gradWeightPtr), convertNative(productElem));
+                                }
+                                ACC::ElementC inputAcc = ACC::ElementC(0);
+                                #pragma unroll
+                                for (uint e = 0; e < E; ++e) {
+                                    const auto weightVal = toCompute(gateWeights[e * H + h]);
+                                    inputAcc = fmaf(weightVal, gradRoutingSoftmax[e], inputAcc);
+                                }
+                                const auto inputElem = toElement(inputAcc);
+                                atomicAdd(CAST_TO(NativeElement, inputRow + h), convertNative(inputElem));
                             }
                         }
                     }

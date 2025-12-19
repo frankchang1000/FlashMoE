@@ -29,13 +29,15 @@ namespace flashmoe::gate {
         static_assert(g == GateReductionLevel::singleBlock && j == JobType::inference);
         TPS* __restrict__ tP;
         BookType* __restrict__ eC;
+        ACC::Element* __restrict__ routingScores;
         __device__
         GateArgs(TPS* const& _tP,
             BookType* const& _eC,
             mp_t* const&,
             mp_t* const&,
             RingSoftmaxPayload* const&,
-            RingTopKPayload* const&) : tP(_tP), eC(_eC) {}
+            RingTopKPayload* const&,
+            ACC::Element* const& _routingScores = nullptr) : tP(_tP), eC(_eC), routingScores(_routingScores) {}
     };
     template<>
     struct GateArgs<GateReductionLevel::singleBlock, JobType::training> {
@@ -43,14 +45,16 @@ namespace flashmoe::gate {
         BookType* __restrict__ eC;
         mp_t* __restrict__ gMeC;
         mp_t* __restrict__ gML;
+        ACC::Element* __restrict__ routingScores;
         __device__
         GateArgs(TPS* const& _tP,
             BookType* const& _eC,
             mp_t* const& _gMeC,
             mp_t* const& _gML,
             RingSoftmaxPayload* const&,
-            RingTopKPayload* const&) :
-        tP(_tP), eC(_eC), gMeC(_gMeC), gML(_gML) {}
+            RingTopKPayload* const&,
+            ACC::Element* const& _routingScores) :
+        tP(_tP), eC(_eC), gMeC(_gMeC), gML(_gML), routingScores(_routingScores) {}
     };
     template<>
     struct GateArgs<GateReductionLevel::multiBlock, JobType::inference> {
@@ -58,14 +62,16 @@ namespace flashmoe::gate {
         BookType* __restrict__ eC;
         RingSoftmaxPayload* __restrict__ bRsP;
         RingTopKPayload* __restrict__ rTp;
+        ACC::Element* __restrict__ routingScores;
         __device__
         GateArgs(TPS* const& _tP,
             BookType* const& _eC,
             mp_t* const&,
             mp_t* const&,
             RingSoftmaxPayload* const& _bRsP,
-            RingTopKPayload* const& _rTp) :
-        tP(_tP), eC(_eC), bRsP(_bRsP), rTp(_rTp) {}
+            RingTopKPayload* const& _rTp,
+            ACC::Element* const& _routingScores = nullptr) :
+        tP(_tP), eC(_eC), bRsP(_bRsP), rTp(_rTp), routingScores(_routingScores) {}
     };
     template<>
     struct GateArgs<GateReductionLevel::multiBlock, JobType::training> {
@@ -75,14 +81,16 @@ namespace flashmoe::gate {
         mp_t* __restrict__ gML;
         RingSoftmaxPayload* __restrict__ bRsP;
         RingTopKPayload* __restrict__ rTp;
+        ACC::Element* __restrict__ routingScores;
         __device__
         GateArgs(TPS* const& _tP,
             BookType* const& _eC,
             mp_t* const& _gMeC,
             mp_t* const& _gML,
             RingSoftmaxPayload* const& _bRsP,
-            RingTopKPayload* const& _rTp) :
-        tP(_tP), eC(_eC), gMeC(_gMeC), gML(_gML), bRsP(_bRsP), rTp(_rTp) {}
+            RingTopKPayload* const& _rTp,
+            ACC::Element* const& _routingScores) :
+        tP(_tP), eC(_eC), gMeC(_gMeC), gML(_gML), bRsP(_bRsP), rTp(_rTp), routingScores(_routingScores) {}
     };
     /// Fused GEMM, softmax, topKMask, and loss, assuming blocks >= tiles.N and no bias.
     /// Supporting the latter is trivial; the former requires a completely new algorithm
@@ -118,6 +126,9 @@ namespace flashmoe::gate {
             typename BlockGEMM::CollectiveMainloop mainLoop{};
             auto accumulator = cute::partition_fragment_C(typename BlockGEMM::MMA{}, typename BlockGEMM::TilerOut{});
             cute::clear(accumulator);
+            using OutputElement = typename MatrixC::value_type;
+            constexpr auto accumSize = size(accumulator);
+            [[maybe_unused]] ElementC preSoftmax[accumSize];
             constexpr auto bM = cute::get<0>(typename BlockGEMM::BlockTiler{});
             constexpr auto bN = cute::get<1>(typename BlockGEMM::BlockTiler{});
             constexpr auto bK = cute::get<2>(typename BlockGEMM::BlockTiler{});
@@ -177,6 +188,12 @@ namespace flashmoe::gate {
                 threadIdx.x,
                 static_cast<char*>(static_cast<void*>(gateScratch)));
             __syncthreads();
+            if constexpr (jT == JobType::training) {
+                #pragma unroll
+                for (uint idx = 0; idx < accumSize; ++idx) {
+                    preSoftmax[idx] = accumulator(idx);
+                }
+            }
 
             /// Epilogue
             static_assert(size(accumulator) % elems == 0);
@@ -216,6 +233,36 @@ namespace flashmoe::gate {
                     #pragma unroll
                     for (uint i = E - E / bN * bN; i < bN; ++i) {
                         accumulator(i) = -cuda::std::numeric_limits<ElementC>::infinity();
+                    }
+                }
+            }
+            if constexpr (jT == JobType::training) {
+                if (gArg.routingScores != nullptr) {
+                    constexpr auto rows = ACC::S::value;
+                    constexpr auto cols = ACC::E::value;
+                    const auto routingPtr = gArg.routingScores;
+                    constexpr auto routingStride = cols;
+                    const auto rowBlockBase = cute::get<0>(tileCoord) * bM;
+                    const auto colBlockBase = cute::get<1>(tileCoord) * bN;
+                    const auto rowStride = threadIdx.x / elems * elems;
+                    const auto colStride = threadIdx.x % elems;
+                    constexpr auto convertToRouting = cutlass::NumericConverter<ACC::Element, ElementC>{};
+                    #pragma unroll
+                    for (uint ii = 0; ii < trips; ++ii) {
+                        const auto colRel = colStride + ii * elems;
+                        #pragma unroll
+                        for (uint jj = 0; jj < elems; ++jj) {
+                            const auto rowRel = rowStride + jj;
+                            if (rowRel >= bM || colRel >= bN) {
+                                continue;
+                            }
+                            const auto rowIdx = rowBlockBase + rowRel;
+                            const auto colIdx = colBlockBase + colRel;
+                            if (rowIdx < rows && colIdx < cols) {
+                                routingPtr[rowIdx * routingStride + colIdx] =
+                                    convertToRouting(accumulator(jj + ii * elems));
+                            }
+                        }
                     }
                 }
             }
@@ -417,6 +464,30 @@ namespace flashmoe::gate {
                     gC(rIdx + j, cIdx + i * elems) = sCR(rIdx + j, swIdx);
                 }
             }
+            if constexpr (jT == JobType::training) {
+                constexpr auto rows = ACC::S::value;
+                constexpr auto cols = ACC::E::value;
+                const auto routingPtr = gArg.routingScores;
+                constexpr auto routingStride = cols;
+                const auto rowBlockBase = cute::get<0>(tileCoord) * bM;
+                const auto colBlockBase = cute::get<1>(tileCoord) * bN;
+                const auto rowStride = threadIdx.x / elems * elems;
+                const auto colStride = threadIdx.x % elems;
+                constexpr auto convertToRouting = cutlass::NumericConverter<OutputElement, ElementC>{};
+                #pragma unroll
+                for (uint ii = 0; ii < trips; ++ii) {
+                    const auto colIdx = colStride + ii * elems;
+                    #pragma unroll
+                    for (uint jj = 0; jj < elems; ++jj) {
+                        const auto rowIdx = rowBlockBase + rowStride + jj;
+                        const auto colIdxFinal = colBlockBase + colIdx;
+                        if (rowIdx < rows && colIdxFinal < cols) {
+                            routingPtr[rowIdx * routingStride + colIdxFinal] =
+                                convertToRouting(preSoftmax[jj + ii * elems]);
+                        }
+                    }
+                }
+            }
 
             // Prior to reusing shared memory
             __syncthreads();
@@ -497,6 +568,15 @@ namespace flashmoe::gate {
             typename BlockGEMM::CollectiveMainloop mainLoop{};
             auto accumulator = cute::partition_fragment_C(typename BlockGEMM::MMA{}, typename BlockGEMM::TilerOut{});
             cute::clear(accumulator);
+            using OutputElement = typename MatrixC::value_type;
+            constexpr auto accumSize = size(accumulator);
+            [[maybe_unused]] ElementC preSoftmax[accumSize];
+            if constexpr (jT == JobType::training) {
+                #pragma unroll
+                for (uint idx = 0; idx < accumSize; ++idx) {
+                    preSoftmax[idx] = accumulator(idx);
+                }
+            }
             constexpr auto bM = cute::get<0>(typename BlockGEMM::BlockTiler{});
             constexpr auto bN = cute::get<1>(typename BlockGEMM::BlockTiler{});
             constexpr auto bK = cute::get<2>(typename BlockGEMM::BlockTiler{});
@@ -738,7 +818,8 @@ namespace flashmoe::gate {
                 bookkeeping.gMeC(),
                 bookkeeping.gML(),
                 bookkeeping.bRsP(),
-                bookkeeping.rTp()
+                bookkeeping.rTp(),
+                bookkeeping.gateRoutingScores()
         };
         using GPUType = ACC::PeakHardware;
         // ALL SMs execute this function
