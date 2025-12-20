@@ -205,9 +205,7 @@ def get_cuda_extensions():
             '--expt-extended-lambda',
             '-rdc=true',
             '--cudart=shared',
-            '-gencode', 'arch=compute_70,code=sm_70',  # V100
-            '-gencode', 'arch=compute_80,code=sm_80',  # A100
-            '-gencode', 'arch=compute_90,code=sm_90',  # H100
+            '-gencode', 'arch=compute_90,code=sm_90',  # H100 only
             '-Xcompiler', '-fPIC',
             "-Xfatbin", "-compress-all",
             '-U__CUDA_NO_HALF_OPERATORS__',

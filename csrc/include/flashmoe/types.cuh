@@ -972,6 +972,12 @@ namespace flashmoe{
         }
         static_assert(alignof(mp_t) == alignof(BookType) &&
             sizeof(BookType) == sizeof(mp_t));
+        __host__ __device__ __forceinline__
+        unsigned long queueSpanEntries() const {
+            return 2UL * gtQCl +
+                ACC::PeakHardware::OS::processorBlocks::value +
+                2UL * ACC::E::value;
+        }
         /// entrypoint for clearing
         __device__ __forceinline__
         auto* gBp() const {

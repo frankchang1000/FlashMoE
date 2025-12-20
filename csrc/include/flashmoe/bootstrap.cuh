@@ -471,9 +471,16 @@ namespace flashmoe{
                    static_cast<long>(layout_tQH) - static_cast<long>(layout_gBp),
                    Bookkeeping::gBz(),
                    hostBookkeeping.gtQCl);
-            
+
             printf("DEBUG: Buffer layout - allocated_b4lt=%lu, instance_ilt=%lu, static_ilt=%lu\n",
                    book_b4lt, hostBookkeeping.ilt, debug_static_ilt);
+            printf("DEBUG: ILT breakdown - base=2 nLx=%u blocks=%u gtQCl_term=%lu E_term=%lu TNx_term=%lu\n",
+                   ePgD.nLx, debug_blocks,
+                   2UL * (debug_gtQCl + ACC::E::value),
+                   static_cast<unsigned long>(ACC::E::value * ACC::TCM::value * ACC::TNx::value),
+                   static_cast<unsigned long>(ACC::TCM::value * ACC::TNx::value));
+            printf("DEBUG: ILT components - E=%u TCM=%u TNx=%u TN=%u world=%u\n",
+                   ACC::E::value, ACC::TCM::value, ACC::TNx::value, ACC::TN::value, ePgD.epWorld);
             fflush(stdout);
         }
         

@@ -1077,12 +1077,61 @@ namespace flashmoe::processor{
         constexpr auto tN = ACC::TN::value;
         constexpr auto tNx = ACC::TNx::value;
         __syncthreads();
+#if FLASHMOE_DEBUG
+        static __shared__ uint processorIterCount;
+        static __shared__ uint processorStuckCount;
+        if (!threadIdx.x) {
+            processorIterCount = 0U;
+            processorStuckCount = 0U;
+        }
+        __syncthreads();
+#endif
         while (!tqs.interrupt) {
             if (constexpr auto wS = 32; threadIdx.x / wS == 0) {
                 if (!threadIdx.x) {
+#if FLASHMOE_DEBUG
+                    processorIterCount++;
+                    processorStuckCount++;
+                    // if (blockIdx.x < 3 && processorIterCount <= 10) {
+                    //     printf("DEBUG processor-loop rank=%d block=%u sb=%u iter=%u waiting for task\n",
+                    //            nvshmem_my_pe(),
+                    //            blockIdx.x,
+                    //            _seqBit,
+                    //            processorIterCount);
+                    // }
+                    if (processorStuckCount >= 100000 && processorStuckCount % 100000 == 0) {
+                        printf("DEBUG processor-stuck rank=%d block=%u sb=%u stuck_iter=%u total_iter=%u\n",
+                               nvshmem_my_pe(),
+                               blockIdx.x,
+                               _seqBit,
+                               processorStuckCount,
+                               processorIterCount);
+                    }
+#endif
                     auto* __restrict__ tQSignal = pA.pDB;
                     // Grabs next task
                     awaitNotification(tQSignal, &tqs, tqs.signal);
+#if FLASHMOE_DEBUG
+                    // if (blockIdx.x < 3 && processorIterCount <= 10) {
+                    //     printf("DEBUG processor-loop rank=%d block=%u sb=%u iter=%u got notification signal=%u interrupt=%u\n",
+                    //            nvshmem_my_pe(),
+                    //            blockIdx.x,
+                    //            _seqBit,
+                    //            processorIterCount,
+                    //            tqs.signal,
+                    //            tqs.interrupt);
+                    // }
+                    if (processorStuckCount >= 100000) {
+                        printf("DEBUG processor-unstuck rank=%d block=%u sb=%u was_stuck=%u signal=%u interrupt=%u\n",
+                               nvshmem_my_pe(),
+                               blockIdx.x,
+                               _seqBit,
+                               processorStuckCount,
+                               tqs.signal,
+                               tqs.interrupt);
+                        processorStuckCount = 0U;
+                    }
+#endif
                     __threadfence();
                     // Eagerly indicate readiness for the next task as the above fence allows us to do so correctly
                     globalInterrupt = tqs.interrupt;
@@ -1104,6 +1153,26 @@ namespace flashmoe::processor{
             if (!tqs.interrupt) {
                 // shared -> registers
                 rCurrentTask = currentTask;
+// #if FLASHMOE_DEBUG
+//                 const bool isGradTask = rCurrentTask.taskType == TaskType::gradPreGEMM ||
+//                     rCurrentTask.taskType == TaskType::gradPostGEMM ||
+//                     rCurrentTask.taskType == TaskType::gradCombine ||
+//                     rCurrentTask.taskType == TaskType::gradWeights ||
+//                     rCurrentTask.taskType == TaskType::gradGateCombine ||
+//                     rCurrentTask.taskType == TaskType::gradGateGEMM;
+//                 const bool isCombineTask = rCurrentTask.taskType == TaskType::combine;
+//                 if (!threadIdx.x && !blockIdx.x && (isGradTask || isCombineTask)) {
+//                     printf("DEBUG processor task sb=%u type=%u tile=%u tileSize=%u peer=%u remote=%u expert=%u M=%u\n",
+//                            rSeqBit,
+//                            static_cast<unsigned>(rCurrentTask.taskType),
+//                            rCurrentTask.tileIdx,
+//                            rCurrentTask.tileSize,
+//                            rCurrentTask.peerIdx,
+//                            static_cast<unsigned>(rCurrentTask.isPeerRemote),
+//                            rCurrentTask.expertIdx,
+//                            rCurrentTask.M);
+//                 }
+// #endif
                 switch (rCurrentTask.taskType) {
                     case TaskType::preGEMM: {
                         constexpr unsigned int preIndex = 0;
@@ -1184,6 +1253,18 @@ namespace flashmoe::processor{
                             rCurrentTask.tileIdx,
                             rCurrentTask.tileSize,
                             rCurrentTask.expertIdx);
+// #if FLASHMOE_DEBUG
+//                         if (!threadIdx.x && !blockIdx.x) {
+//                             printf("DEBUG combine complete rank=%d sb=%u tile=%u tileSize=%u expert=%u peer=%u remote=%u\n",
+//                                    nvshmem_my_pe(),
+//                                    rSeqBit,
+//                                    rCurrentTask.tileIdx,
+//                                    rCurrentTask.tileSize,
+//                                    rCurrentTask.expertIdx,
+//                                    rCurrentTask.peerIdx,
+//                                    static_cast<unsigned>(rCurrentTask.isPeerRemote));
+//                         }
+// #endif
                     }
                     break;
                     case TaskType::gradCombine: {
@@ -1197,6 +1278,17 @@ namespace flashmoe::processor{
                             rCurrentTask.tileIdx,
                             rCurrentTask.tileSize,
                             rCurrentTask.expertIdx);
+// #if FLASHMOE_DEBUG
+//                         if (!threadIdx.x && !blockIdx.x) {
+//                             printf("DEBUG gradCombine split sb=%u tile=%u tileSize=%u expert=%u peer=%u remote=%u\n",
+//                                    rSeqBit,
+//                                    rCurrentTask.tileIdx,
+//                                    rCurrentTask.tileSize,
+//                                    rCurrentTask.expertIdx,
+//                                    rCurrentTask.peerIdx,
+//                                    static_cast<unsigned>(rCurrentTask.isPeerRemote));
+//                         }
+// #endif
                         __syncthreads();
                         if (!threadIdx.x) {
                             __threadfence();

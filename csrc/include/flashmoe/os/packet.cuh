@@ -53,6 +53,9 @@ namespace flashmoe::packet {
         auto* __restrict__ pSA = bookkeeping.pSA();
         auto* __restrict__ sHeap = bookkeeping.sHeap;
         auto* __restrict__ flags = bookkeeping.flags;
+        constexpr uint16_t gradStart = static_cast<uint16_t>(SignalConstants::gradSequenceStart);
+        constexpr uint16_t gradEnd = gradStart + 2;
+        const bool isGradientSeq = rSeqBit >= gradStart && rSeqBit <= gradEnd;
 
         const auto tokenIds = make_tensor(cute::make_gmem_ptr(tP),
             cute::Layout<cute::Shape<cute::Int<E>, cute::Int<pEC>>,
@@ -118,6 +121,26 @@ namespace flashmoe::packet {
                     const auto partition = routedTokens / superBlockSize +
                         (lBid < routedTokens % superBlockSize);
                     const auto trips = partition / batch;
+                    const auto residueCount = partition - trips * batch;
+// #if FLASHMOE_DEBUG
+//                     if (isLeader && !lBid) {
+//                         constexpr unsigned int debugMaxExperts = 8;
+//                         if (expertIdx < debugMaxExperts) {
+//                             const auto totalTiles = Bookkeeping::tiles<BLOCK_M>(routedTokens);
+//                             printf("DEBUG dispatch rank=%d sb=%u expert=%u peer=%u routed=%u tiles=%u partition=%u residue=%u remote=%u gradSeq=%u\n",
+//                                    nvshmem_my_pe(),
+//                                    rSeqBit,
+//                                    expertIdx,
+//                                    lI.peer,
+//                                    routedTokens,
+//                                    totalTiles,
+//                                    partition,
+//                                    residueCount,
+//                                    static_cast<unsigned>(lI.isRemote),
+//                                    static_cast<unsigned>(isGradientSeq));
+//                         }
+//                     }
+// #endif
                     if (trips) {
                         // prefetch
                         // global -> shared
@@ -167,7 +190,7 @@ namespace flashmoe::packet {
                         }
                     }
                     // residue
-                    if (const auto residue = partition - trips * batch; residue) {
+                    if (const auto residue = residueCount; residue) {
                         // global -> shared
                         for (uint k = 0; k < residue; ++k) {
                             const auto [tokenIdx, _] = tokenIds(expertIdx, lBid + (k + trips * batch) * superBlockSize);
@@ -218,6 +241,33 @@ namespace flashmoe::packet {
                                 lI.pTTt,
                                 rSeqBit
                             };
+#if FLASHMOE_DEBUG
+                            // if (!isGradientSeq) {
+                            //     printf("DEBUG fwd dispatch signal rank=%d block=%u sb=%u expert=%u peer=%u routed=%u totalTiles=%u remote=%u flag=%u flagPtr=%p\n",
+                            //            nvshmem_my_pe(),
+                            //            blockIdx.x,
+                            //            rSeqBit,
+                            //            expertIdx,
+                            //            lI.peer,
+                            //            routedTokens,
+                            //            lI.pTTt,
+                            //            static_cast<unsigned>(lI.isRemote),
+                            //            flagOffset,
+                            //            flags + flagOffset);
+                            // }
+                            // if (isGradientSeq) {
+                            //     printf("DEBUG grad packet initial signal sb=%u expert=%u peer=%u routed=%u totalTiles=%u partition=%u residue=%u remote=%u flag=%u\n",
+                            //            rSeqBit,
+                            //            expertIdx,
+                            //            lI.peer,
+                            //            routedTokens,
+                            //            lI.pTTt,
+                            //            partition,
+                            //            residueCount,
+                            //            static_cast<unsigned>(lI.isRemote),
+                            //            flagOffset);
+                            // }
+#endif
                             if (lI.isRemote) {
                                 // do RDMA transfer + signal
                                 nvshmem_putmem_signal_nbi(
@@ -245,6 +295,28 @@ namespace flashmoe::packet {
                         lI.pTTt,
                         rSeqBit
                     };
+// #if FLASHMOE_DEBUG
+//                     if (!isGradientSeq) {
+//                         printf("DEBUG fwd dispatch noop rank=%d block=%u sb=%u expert=%u peer=%u totalTiles=%u remote=%u flag=%u\n",
+//                                nvshmem_my_pe(),
+//                                blockIdx.x,
+//                                rSeqBit,
+//                                expertIdx,
+//                                lI.peer,
+//                                lI.pTTt,
+//                                static_cast<unsigned>(lI.isRemote),
+//                                flagOffset);
+//                     }
+//                     if (isGradientSeq) {
+//                         printf("DEBUG grad packet initial noop sb=%u expert=%u peer=%u totalTiles=%u remote=%u flag=%u\n",
+//                                rSeqBit,
+//                                expertIdx,
+//                                lI.peer,
+//                                lI.pTTt,
+//                                static_cast<unsigned>(lI.isRemote),
+//                                flagOffset);
+//                     }
+// #endif
                     if (lI.isRemote) {
                         // transmit signal
                         nvshmemx_signal_op(flags + flagOffset,
@@ -419,7 +491,14 @@ namespace flashmoe::packet {
             const unsigned int& expertIdx) const {
             constexpr auto jobTaskType = m == JobMode::forward ?
                 TaskType::combine : TaskType::gradCombine;
-            tQ[DQ::sNext(lTQHead++)] = Task{
+            constexpr auto isGradient = m == JobMode::gradient;
+            const auto emitTask = [&](const Task& task) {
+                tQ[DQ::sNext(lTQHead++)] = task;
+                __threadfence();
+                atomicIncrement<cuda::thread_scope_block>(tQHead);
+            };
+
+            Task gradTask{
                 jobTaskType,
                 tokenIndices,
                 cuda::std::array<const cuda::std::byte*, GEMMs>{packet},
@@ -427,8 +506,19 @@ namespace flashmoe::packet {
                 tileIdx,
                 expertIdx
             };
-            __threadfence();
-            atomicIncrement<cuda::thread_scope_block>(tQHead);
+            emitTask(gradTask);
+            if constexpr (isGradient) {
+                Task gateTask{
+                    TaskType::gradGateCombine,
+                    tokenIndices,
+                    cuda::std::array<const cuda::std::byte*, GEMMs>{packet},
+                    nTokens,
+                    tileIdx,
+                    expertIdx
+                };
+                gateTask.cData[0] = const_cast<cuda::std::byte*>(packet);
+                emitTask(gateTask);
+            }
         }
     };
 
@@ -444,6 +534,7 @@ namespace flashmoe::packet {
             const unsigned int& expertIdx) const {
             constexpr auto jobTaskType = m == JobMode::forward ?
                 TaskType::combine : TaskType::gradCombine;
+            constexpr auto isGradient = m == JobMode::gradient;
             const auto qIdx = DQ::sNext(lTQHead);
             constexpr auto tNx = ACC::TNx::value;
             for (uint i = 0; i < tNx; ++i) {
@@ -456,9 +547,27 @@ namespace flashmoe::packet {
                     expertIdx
                 };
             }
-            lTQHead += tNx;
+
+            if constexpr (isGradient) {
+                for (uint i = 0; i < tNx; ++i) {
+                    const auto gateIdx = DQ::next(qIdx, tNx + i);
+                    Task gateTask{
+                        TaskType::gradGateCombine,
+                        tokenIndices,
+                        cuda::std::array<const cuda::std::byte*, GEMMs>{packet},
+                        nTokens,
+                        i,
+                        expertIdx
+                    };
+                    gateTask.cData[0] = const_cast<cuda::std::byte*>(packet);
+                    dA.tQ[gateIdx] = gateTask;
+                }
+            }
+
+            constexpr auto totalTasks = tNx * (isGradient ? 2U : 1U);
+            lTQHead += totalTasks;
             __threadfence();
-            atomicAdd_block(tQHead, tNx);
+            atomicAdd_block(tQHead, totalTasks);
         }
     };
 }
