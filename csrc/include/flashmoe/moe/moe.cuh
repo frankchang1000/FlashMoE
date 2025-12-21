@@ -23,6 +23,8 @@
 namespace flashmoe::moe{
     __device__ const ACC::Element* hiddenStatesPtr = nullptr;
     __device__ const ACC::Element* gateWeightsPtr = nullptr;
+    __device__ const ACC::Element* gradOutputBasePtr = nullptr;  // For gradGateCombine to access full grad_output
+    __device__ ACC::Element* gradInputBasePtr = nullptr;  // For gradGateGEMM to write input gradients
     __device__ cuda::std::array<const cuda::std::byte*, GEMMs> savedActivationPtrs{};
 
     __host__ __forceinline__
@@ -145,20 +147,20 @@ namespace flashmoe::moe{
         // Grid barrier ensures all blocks complete clearState before any proceeds.
         // This prevents race between pSA clearing and dispatch's atomicIncrement.
         gridBarrier();
-#if FLASHMOE_DEBUG
-        if (!threadIdx.x && !blockIdx.x) {
-            const auto queueSpan = bookkeeping.queueSpanEntries();
-            const auto gtQueueEntries = bookkeeping.gtQCl;
-            const auto processorBlocks = ACC::PeakHardware::OS::processorBlocks::value;
-            printf("DEBUG queue layout rank=%d sb=%u spanEntries=%lu gtQCl=%u procBlocks=%u eCount=%u\n",
-                   nvshmem_my_pe(),
-                   sb,
-                   queueSpan,
-                   gtQueueEntries,
-                   processorBlocks,
-                   ACC::E::value);
-        }
-#endif
+// #if FLASHMOE_DEBUG
+//         if (!threadIdx.x && !blockIdx.x) {
+//             const auto queueSpan = bookkeeping.queueSpanEntries();
+//             const auto gtQueueEntries = bookkeeping.gtQCl;
+//             const auto processorBlocks = ACC::PeakHardware::OS::processorBlocks::value;
+//             printf("DEBUG queue layout rank=%d sb=%u spanEntries=%lu gtQCl=%u procBlocks=%u eCount=%u\n",
+//                    nvshmem_my_pe(),
+//                    sb,
+//                    queueSpan,
+//                    gtQueueEntries,
+//                    processorBlocks,
+//                    ACC::E::value);
+//         }
+// #endif
 
         // prep tensors
         const auto activations = make_tensor(
@@ -408,8 +410,11 @@ namespace flashmoe::moe{
         if (!threadIdx.x && !blockIdx.x) {
             hiddenStatesPtr = CONST_CAST_TO(Element, savedActivationPtrs[0]);
             gateWeightsPtr = gP;
-            printf("DEBUG backward kernel entry: sb=%u lE=%u base=%p gP=%p ePu=%p\n",
-                   sb, lE, base, gP, ePu);
+            gradOutputBasePtr = CONST_CAST_TO(Element, gradOutputPtr);
+            gradInputBasePtr = CAST_TO(Element, gradInputPtr);
+            printf("DEBUG backward kernel entry: sb=%u lE=%u nLx=%u xs=%u world=%u rank=%u sHeap=%p gW=%p\n",
+                   sb, lE, bookkeeping.nLx, bookkeeping.xs, bookkeeping.world, bookkeeping.rank,
+                   bookkeeping.sHeap, bookkeeping.gW());
         }
         __syncthreads();
 
@@ -428,14 +433,14 @@ namespace flashmoe::moe{
             if (blockIdx.x + 1 < blocks) {
                 if (blockIdx.x < ACC::DBZ::value) {
                     packet::dispatch<ACC::DBZ::value, d, ACC::SBZ::value>(gradOutput, workspace, sb);
-                    if (!threadIdx.x && !blockIdx.x) {
-                        printf("DEBUG backward kernel dispatcher done (sb=%u)\n", sb);
-                    }
+                    // if (!threadIdx.x && !blockIdx.x) {
+                    //     printf("DEBUG backward kernel dispatcher done (sb=%u)\n", sb);
+                    // }
                 }
                 processor::start(workspace, gradOutput, gradInput, sb);
-                if (!threadIdx.x && !blockIdx.x) {
-                    printf("DEBUG backward kernel processor start invoked (sb=%u)\n", sb);
-                }
+                // if (!threadIdx.x && !blockIdx.x) {
+                //     printf("DEBUG backward kernel processor start invoked (sb=%u)\n", sb);
+                // }
             }
             else {
                 os::start<processors, d>(
@@ -446,9 +451,9 @@ namespace flashmoe::moe{
                     biasDown,
                     savedActivationPtrs,
                     sb);
-                if (!threadIdx.x && !blockIdx.x) {
-                    printf("DEBUG backward kernel os start invoked (sb=%u)\n", sb);
-                }
+                // if (!threadIdx.x && !blockIdx.x) {
+                //     printf("DEBUG backward kernel os start invoked (sb=%u)\n", sb);
+                // }
             }
         }
     }
@@ -612,15 +617,15 @@ namespace flashmoe::moe{
         constexpr auto blocks = ACC::PeakHardware::blocks::value;
         constexpr auto threads = ACC::PeakHardware::OS::threads::value;
         uint16_t gradSeqBit = static_cast<uint16_t>(SignalConstants::gradSequenceStart);
-        printf("DEBUG backwardHost: launching kernel seqBit=%u saved=%p\n",
-               gradSeqBit, savedActivations);
+        // printf("DEBUG backwardHost: launching kernel seqBit=%u saved=%p\n",
+        //        gradSeqBit, savedActivations);
         FLASHMOE_CHECK_CUDA(cudaEventRecord(start, flashmoeStream));
         backward<<<blocks, threads, 0, flashmoeStream>>>(
             gradOutputPtr, gradInputPtr, gradWeightsPtr, gradSeqBit);
         gradSeqBit = sbs::nextGrad(gradSeqBit);
         FLASHMOE_CHECK_CUDA(cudaEventRecord(stop, flashmoeStream));
         FLASHMOE_CHECK_CUDA(cudaStreamSynchronize(flashmoeStream));
-        printf("DEBUG backwardHost: kernel completed seqBit=%u\n", gradSeqBit);
+        // printf("DEBUG backwardHost: kernel completed seqBit=%u\n", gradSeqBit);
         FLASHMOE_CHECK_CUDA(cudaEventElapsedTime(&duration, start, stop));
         FLASHMOE_CHECK_CUDA(cudaEventDestroy(start));
         FLASHMOE_CHECK_CUDA(cudaEventDestroy(stop));

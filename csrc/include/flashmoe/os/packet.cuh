@@ -423,7 +423,7 @@ namespace flashmoe::packet {
             unsigned int& lTQHead,
             unsigned int* __restrict__ const& tQHead) const {
             constexpr auto jobTaskType = m == JobMode::forward ?
-                TaskType::preGEMM : TaskType::gradPreGEMM;
+                TaskType::preGEMM : TaskType::gradPostGEMM;
             constexpr auto tN = ACC::TN::value;
             const auto qIdx = DQ::sNext(lTQHead);
             const auto fTilesM = routedTokens / BLOCK_M;
@@ -525,6 +525,8 @@ namespace flashmoe::packet {
                 tileIdx,
                 expertIdx
             };
+            // cData[0] = output destination for split gradients (writes to expert packet)
+            gradTask.cData[0] = const_cast<cuda::std::byte*>(packet);
             emitTask(gradTask);
             if constexpr (isGradient) {
                 Task gateTask{
@@ -557,7 +559,7 @@ namespace flashmoe::packet {
             const auto qIdx = DQ::sNext(lTQHead);
             constexpr auto tNx = ACC::TNx::value;
             for (uint i = 0; i < tNx; ++i) {
-                dA.tQ[DQ::next(qIdx, i)] = Task{
+                Task gradTask{
                     jobTaskType,
                     tokenIndices,
                     cuda::std::array<const cuda::std::byte*, GEMMs>{packet},
@@ -565,6 +567,9 @@ namespace flashmoe::packet {
                     i,
                     expertIdx
                 };
+                // cData[0] = output destination for split gradients (writes to expert packet)
+                gradTask.cData[0] = const_cast<cuda::std::byte*>(packet);
+                dA.tQ[DQ::next(qIdx, i)] = gradTask;
             }
 
             if constexpr (isGradient) {

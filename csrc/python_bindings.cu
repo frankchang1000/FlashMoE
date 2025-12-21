@@ -122,7 +122,7 @@ torch::Tensor moe_forward(
     
     // Call kernel
     float timed = 0;
-    flashmoe::moe::forwardHostBench<32, 32>(p, p + dZ * sizeof(Element), timed);
+    flashmoe::moe::forwardHostBench<0, 1>(p, p + dZ * sizeof(Element), timed);
     
     printf("Process %d: FlashMoE forward pass took %.2f ms\n", rank, timed);
     
@@ -241,9 +241,15 @@ py::tuple moe_backward(
         ));
     }
 
+    // z1: preGEMM pre-activation values, z2: postGEMM pre-activation values
+    TORCH_CHECK(flashmoe::hostBookkeeping.savedZ1 != nullptr,
+        "Saved activation z1 buffer is not initialized");
+    TORCH_CHECK(flashmoe::hostBookkeeping.savedZ2 != nullptr,
+        "Saved activation z2 buffer is not initialized");
+
     const auto savedActivations = cuda::std::array<const cuda::std::byte*, GEMMs>{
-        CONST_CAST_TO(cuda::std::byte, dP),
-        CONST_CAST_TO(cuda::std::byte, dP + aZ)
+        CONST_CAST_TO(cuda::std::byte, flashmoe::hostBookkeeping.savedZ1),
+        CONST_CAST_TO(cuda::std::byte, flashmoe::hostBookkeeping.savedZ2)
     };
 
     auto grad_input = torch::empty_like(input);
@@ -278,6 +284,21 @@ py::tuple moe_backward(
     auto grad_expert_down = torch::empty({static_cast<int64_t>(nLx), P, H}, options);
     auto grad_bias_up = torch::empty({static_cast<int64_t>(nLx), P}, options);
     auto grad_bias_down = torch::empty({static_cast<int64_t>(nLx), H}, options);
+    {
+        const auto totalGradWeightsSize = (2 * P * H + P + H) * nLx;
+        float debugVals[10] = {0};
+        const auto numToCheck = std::min(10UL, static_cast<unsigned long>(totalGradWeightsSize));
+        FLASHMOE_CHECK_CUDA(cudaMemcpy(debugVals, flashmoe::hostBookkeeping.gradWeights,
+            numToCheck * sizeof(float), cudaMemcpyDeviceToHost));
+        float debugSum = 0;
+        for (size_t i = 0; i < numToCheck; ++i) {
+            debugSum += debugVals[i];
+        }
+        printf("DEBUG moe_backward: gradWeights buffer check - first 10 vals sum=%.6f, vals=[%.4f,%.4f,%.4f,%.4f,...]\n",
+               debugSum, debugVals[0], debugVals[1], debugVals[2], debugVals[3]);
+        printf("DEBUG moe_backward: gradWeights ptr=%p, nLx=%u, expertStride=%lu, totalSize=%lu\n",
+               flashmoe::hostBookkeeping.gradWeights, nLx, 2UL * P * H + P + H, totalGradWeightsSize);
+    }
 
     const auto expertStride = 2 * P * H + P + H;
     for (uint i = 0; i < nLx; ++i) {
