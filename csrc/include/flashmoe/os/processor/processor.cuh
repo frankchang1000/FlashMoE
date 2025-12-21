@@ -1209,7 +1209,7 @@ namespace flashmoe::processor{
                             CAST_TO(typename PostGEMM::MatrixDType, rCurrentTask.cData[postIndex]),
                             CONST_CAST_TO(typename PostGEMM::MatrixDType, rCurrentTask.dData[postIndex]),
                             rCurrentTask.M,
-                            currentTask.tileIdx);
+                            rCurrentTask.tileIdx);  // was prev currentTask.tileIdx. look into this
                         __syncthreads();
                         if (!threadIdx.x) {
                             // Pack payload into single signal word of 8 bytes

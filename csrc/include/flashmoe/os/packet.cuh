@@ -122,6 +122,23 @@ namespace flashmoe::packet {
                         (lBid < routedTokens % superBlockSize);
                     const auto trips = partition / batch;
                     const auto residueCount = partition - trips * batch;
+#if FLASHMOE_DEBUG
+                    // Debug: Show dispatch TPS->heap mapping for first expert, first block
+                    if (!threadIdx.x && !blockIdx.x && expertIdx == 0 && !lBid) {
+                        // Sample first 4 TPS entries for this expert
+                        const auto tps0 = tokenIds(expertIdx, 0);
+                        const auto tps1 = tokenIds(expertIdx, 1);
+                        const auto tps2 = tokenIds(expertIdx, 2);
+                        const auto tps3 = tokenIds(expertIdx, 3);
+                        printf("DEBUG dispatch rank=%d expert=%u routedTokens=%u "
+                               "TPS[0..3]={tok=%u,prob=%.4f},{tok=%u,prob=%.4f},{tok=%u,prob=%.4f},{tok=%u,prob=%.4f}\n",
+                               nvshmem_my_pe(), expertIdx, routedTokens,
+                               tps0.tokenIdx, static_cast<float>(tps0.probability),
+                               tps1.tokenIdx, static_cast<float>(tps1.probability),
+                               tps2.tokenIdx, static_cast<float>(tps2.probability),
+                               tps3.tokenIdx, static_cast<float>(tps3.probability));
+                    }
+#endif
 // #if FLASHMOE_DEBUG
 //                     if (isLeader && !lBid) {
 //                         constexpr unsigned int debugMaxExperts = 8;
@@ -227,13 +244,15 @@ namespace flashmoe::packet {
                         }
                     }
                     __syncthreads();
+                    // all threads must fence to ensure their heap writes are visible to peer.
+                    if (lI.isRemote) {
+                        __threadfence();
+                    }
+                    else {
+                        __threadfence_system();
+                    }
+                    __syncthreads();  // wait for all threads to complete their fences
                     if (!threadIdx.x) {
-                        if (lI.isRemote) {
-                            __threadfence();
-                        }
-                        else {
-                            __threadfence_system();
-                        }
                         if (atomicIncrement(pSA + expertIdx) + 1 == superBlockSize) {
                             // I am in the last block, let's finalize this transfer.
                             const auto sigPayload = SignalPayload<PacketStage::initial>{

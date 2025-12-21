@@ -198,6 +198,11 @@ namespace flashmoe::moe{
                 cute::Stride<cute::Int<H>, cute::_1>>{});
 
         gate::forward(activations, gateWeights, gateOutput, CAST_TO(ElementC, workspace));
+        gridBarrier();
+        if (!threadIdx.x && !blockIdx.x) {
+            nvshmem_barrier_all(); // sync across ranks after gate forward
+        }
+        gridBarrier();
 // #if FLASHMOE_DEBUG
 //         if (!threadIdx.x && !blockIdx.x) {
 //             const auto gateCount = static_cast<size_t>(ACC::S::value) * ACC::PX::value;
