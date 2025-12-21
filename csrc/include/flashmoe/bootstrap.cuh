@@ -380,7 +380,10 @@ namespace flashmoe{
         Element* routingScores = nullptr;
         Element* gradGateCombine = nullptr;
         Element* gradGateGEMM = nullptr;
-        
+        Element* savedZ1 = nullptr;
+        Element* savedZ2 = nullptr;
+        BookType* savedEC = nullptr;
+
         FLASHMOE_CHECK_CUDA(cudaMallocAsync(&bookTask, sizeof(Task) * Bookkeeping::tQlt(ePgD.nLx, ePgD.epWorld), flashmoeStream));
         FLASHMOE_CHECK_CUDA(cudaMallocAsync(&bookPEL, sizeof(PEL) * ACC::E::value, flashmoeStream));
         FLASHMOE_CHECK_CUDA(cudaMallocAsync(&bookPLI, sizeof(PLI) * ePgD.epWorld, flashmoeStream));
@@ -410,12 +413,23 @@ namespace flashmoe{
                 sizeof(Element) * Bookkeeping::gGateCombineLt(), flashmoeStream));
             FLASHMOE_CHECK_CUDA(cudaMallocAsync(&gradGateGEMM,
                 sizeof(Element) * Bookkeeping::gGateGEMMLt(), flashmoeStream));
-            printf("DEBUG: training build - allocated grad buffers (bytes) gW=%lu gateW=%lu routing=%lu combine=%lu gemm=%lu\n",
+            // Allocate saved activation buffers for gradient computation
+            FLASHMOE_CHECK_CUDA(cudaMallocAsync(&savedZ1,
+                sizeof(Element) * Bookkeeping::z1lt(ePgD.nLx, ePgD.epWorld), flashmoeStream));
+            FLASHMOE_CHECK_CUDA(cudaMallocAsync(&savedZ2,
+                sizeof(Element) * Bookkeeping::z2lt(ePgD.nLx, ePgD.epWorld), flashmoeStream));
+            // Allocate saved expert counts for backward pass routing
+            FLASHMOE_CHECK_CUDA(cudaMallocAsync(&savedEC,
+                sizeof(BookType) * Bookkeeping::sEClt(), flashmoeStream));
+            printf("DEBUG: training build - allocated grad buffers (bytes) gW=%lu gateW=%lu routing=%lu combine=%lu gemm=%lu z1=%lu z2=%lu savedEC=%lu\n",
                 sizeof(Element) * Bookkeeping::gWlt(ePgD.nLx),
                 sizeof(Element) * Bookkeeping::gGateWlt(),
                 sizeof(Element) * Bookkeeping::gateRoutingScoresLt(),
                 sizeof(Element) * Bookkeeping::gGateCombineLt(),
-                sizeof(Element) * Bookkeeping::gGateGEMMLt());
+                sizeof(Element) * Bookkeeping::gGateGEMMLt(),
+                sizeof(Element) * Bookkeeping::z1lt(ePgD.nLx, ePgD.epWorld),
+                sizeof(Element) * Bookkeeping::z2lt(ePgD.nLx, ePgD.epWorld),
+                sizeof(BookType) * Bookkeeping::sEClt());
         } else {
             printf("DEBUG: inference build - grad buffers skipped\n");
         }
@@ -435,6 +449,12 @@ namespace flashmoe{
                 sizeof(Element) * Bookkeeping::gGateCombineLt(), flashmoeStream));
             FLASHMOE_CHECK_CUDA(cudaMemsetAsync(gradGateGEMM, 0,
                 sizeof(Element) * Bookkeeping::gGateGEMMLt(), flashmoeStream));
+            FLASHMOE_CHECK_CUDA(cudaMemsetAsync(savedZ1, 0,
+                sizeof(Element) * Bookkeeping::z1lt(ePgD.nLx, ePgD.epWorld), flashmoeStream));
+            FLASHMOE_CHECK_CUDA(cudaMemsetAsync(savedZ2, 0,
+                sizeof(Element) * Bookkeeping::z2lt(ePgD.nLx, ePgD.epWorld), flashmoeStream));
+            FLASHMOE_CHECK_CUDA(cudaMemsetAsync(savedEC, 0,
+                sizeof(BookType) * Bookkeeping::sEClt(), flashmoeStream));
         }
         hostBookkeeping = Bookkeeping{
             flags,
@@ -455,6 +475,9 @@ namespace flashmoe{
             routingScores,
             gradGateCombine,
             gradGateGEMM,
+            savedZ1,
+            savedZ2,
+            savedEC,
             ePgD
         };
         
@@ -595,6 +618,9 @@ namespace flashmoe{
         Element* routingScores = nullptr;
         Element* gradGateCombine = nullptr;
         Element* gradGateGEMM = nullptr;
+        Element* savedZ1 = nullptr;
+        Element* savedZ2 = nullptr;
+        BookType* savedEC = nullptr;
         FLASHMOE_CHECK_CUDA(cudaMallocAsync(&book,
             sizeof(BookType) * Bookkeeping::b4lt(), flashmoeStream));
         FLASHMOE_CHECK_CUDA(cudaMallocAsync(&bookElement,
@@ -610,6 +636,14 @@ namespace flashmoe{
                 sizeof(Element) * Bookkeeping::gGateCombineLt(), flashmoeStream));
             FLASHMOE_CHECK_CUDA(cudaMallocAsync(&gradGateGEMM,
                 sizeof(Element) * Bookkeeping::gGateGEMMLt(), flashmoeStream));
+            // For singleton mode, use E as both nLx and world (single process)
+            FLASHMOE_CHECK_CUDA(cudaMallocAsync(&savedZ1,
+                sizeof(Element) * Bookkeeping::z1lt(ACC::E::value, 1), flashmoeStream));
+            FLASHMOE_CHECK_CUDA(cudaMallocAsync(&savedZ2,
+                sizeof(Element) * Bookkeeping::z2lt(ACC::E::value, 1), flashmoeStream));
+            // Allocate saved expert counts for backward pass routing
+            FLASHMOE_CHECK_CUDA(cudaMallocAsync(&savedEC,
+                sizeof(BookType) * Bookkeeping::sEClt(), flashmoeStream));
             FLASHMOE_CHECK_CUDA(cudaMemsetAsync(gradWeights, 0,
                 sizeof(Element) * Bookkeeping::gWlt(ACC::E::value), flashmoeStream));
             FLASHMOE_CHECK_CUDA(cudaMemsetAsync(gradGateWeights, 0,
@@ -620,12 +654,21 @@ namespace flashmoe{
                 sizeof(Element) * Bookkeeping::gGateCombineLt(), flashmoeStream));
             FLASHMOE_CHECK_CUDA(cudaMemsetAsync(gradGateGEMM, 0,
                 sizeof(Element) * Bookkeeping::gGateGEMMLt(), flashmoeStream));
-            printf("DEBUG: training singleton build - allocated grad buffers (bytes) gW=%lu gateW=%lu routing=%lu combine=%lu gemm=%lu\n",
+            FLASHMOE_CHECK_CUDA(cudaMemsetAsync(savedZ1, 0,
+                sizeof(Element) * Bookkeeping::z1lt(ACC::E::value, 1), flashmoeStream));
+            FLASHMOE_CHECK_CUDA(cudaMemsetAsync(savedZ2, 0,
+                sizeof(Element) * Bookkeeping::z2lt(ACC::E::value, 1), flashmoeStream));
+            FLASHMOE_CHECK_CUDA(cudaMemsetAsync(savedEC, 0,
+                sizeof(BookType) * Bookkeeping::sEClt(), flashmoeStream));
+            printf("DEBUG: training singleton build - allocated grad buffers (bytes) gW=%lu gateW=%lu routing=%lu combine=%lu gemm=%lu z1=%lu z2=%lu savedEC=%lu\n",
                 sizeof(Element) * Bookkeeping::gWlt(ACC::E::value),
                 sizeof(Element) * Bookkeeping::gGateWlt(),
                 sizeof(Element) * Bookkeeping::gateRoutingScoresLt(),
                 sizeof(Element) * Bookkeeping::gGateCombineLt(),
-                sizeof(Element) * Bookkeeping::gGateGEMMLt());
+                sizeof(Element) * Bookkeeping::gGateGEMMLt(),
+                sizeof(Element) * Bookkeeping::z1lt(ACC::E::value, 1),
+                sizeof(Element) * Bookkeeping::z2lt(ACC::E::value, 1),
+                sizeof(BookType) * Bookkeeping::sEClt());
         } else {
             printf("DEBUG: singleton inference build - grad buffers skipped\n");
         }
@@ -636,7 +679,10 @@ namespace flashmoe{
             gradGateWeights,
             routingScores,
             gradGateCombine,
-            gradGateGEMM
+            gradGateGEMM,
+            savedZ1,
+            savedZ2,
+            savedEC
         };
         FLASHMOE_CHECK_CUDA(cudaMemcpyToSymbolAsync(bookkeeping, &hostBookkeeping,
             sizeof(Bookkeeping), 0,
@@ -710,6 +756,15 @@ namespace flashmoe{
             }
             if (hostBookkeeping.gradGateGEMM != nullptr) {
                 FLASHMOE_CHECK_CUDA(cudaFreeAsync(hostBookkeeping.gradGateGEMM, flashmoeStream));
+            }
+            if (hostBookkeeping.savedZ1 != nullptr) {
+                FLASHMOE_CHECK_CUDA(cudaFreeAsync(hostBookkeeping.savedZ1, flashmoeStream));
+            }
+            if (hostBookkeeping.savedZ2 != nullptr) {
+                FLASHMOE_CHECK_CUDA(cudaFreeAsync(hostBookkeeping.savedZ2, flashmoeStream));
+            }
+            if (hostBookkeeping.savedEC != nullptr) {
+                FLASHMOE_CHECK_CUDA(cudaFreeAsync(hostBookkeeping.savedEC, flashmoeStream));
             }
         }
         // Below ensures all work is done before deallocating via the external API

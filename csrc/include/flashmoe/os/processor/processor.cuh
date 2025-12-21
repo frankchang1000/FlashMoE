@@ -102,6 +102,25 @@ namespace flashmoe::processor{
         static_assert(bM == threads);
         sTPS[threadIdx.x] = tokenIndices[threadIdx.x];
         __syncthreads();
+#if FLASHMOE_DEBUG
+        // Debug: verify TPS data and input heap data
+        if (!threadIdx.x && !blockIdx.x) {
+            // Sample input data from heap (first 4 elements of first row)
+            const auto inputSample0 = static_cast<float>(inputs[0]);
+            const auto inputSample1 = static_cast<float>(inputs[1]);
+            const auto inputSample2 = static_cast<float>(inputs[2]);
+            const auto inputSample3 = static_cast<float>(inputs[3]);
+            // Sample TPS probabilities
+            const auto prob0 = static_cast<float>(sTPS[0].probability);
+            const auto prob1 = static_cast<float>(sTPS[1].probability);
+            printf("DEBUG combine-input rank=%d tile=%u expert=%u tileSize=%u "
+                   "heapData[0..3]=[%.2f,%.2f,%.2f,%.2f] "
+                   "TPS[0]={tok=%u,prob=%.4f} TPS[1]={tok=%u,prob=%.4f}\n",
+                   nvshmem_my_pe(), tileIdx, expertIdx, tileSize,
+                   inputSample0, inputSample1, inputSample2, inputSample3,
+                   sTPS[0].tokenIdx, prob0, sTPS[1].tokenIdx, prob1);
+        }
+#endif
         // Eagerly prefetch inputs to registers
         #pragma unroll
         for (uint i = 0; i < trips; ++i) {
@@ -538,6 +557,7 @@ namespace flashmoe::processor{
     }
 
     // fused GEMM, epilogue and data transfer, with dynamic M and static N and K
+    // Optional preActivationOutput parameter for saving z values (pre-activation) during forward pass
     template<
         typename BlockGEMM,
         unsigned int N,
@@ -552,7 +572,8 @@ namespace flashmoe::processor{
         typename BlockGEMM::MatrixDType* __restrict__ const& output,
         const typename BlockGEMM::MatrixDType* __restrict__ const& bias,
         const unsigned int& M,
-        const unsigned int& tileIdx) {
+        const unsigned int& tileIdx,
+        typename BlockGEMM::MatrixDType* __restrict__ const& preActivationOutput = nullptr) {
         auto accumulator = cute::partition_fragment_C(typename BlockGEMM::MMA{}, typename BlockGEMM::TilerOut{});
         static_assert(cute::size(accumulator) % elems == 0);
         constexpr auto bM = cute::get<0>(typename BlockGEMM::BlockTiler{});
@@ -669,6 +690,29 @@ namespace flashmoe::processor{
 
         const auto rIdx = threadIdx.x / elems * elems;
         const auto cIdx = threadIdx.x % elems;
+
+        // Save pre-activation values (z = accumulator + bias) if buffer is provided
+        // This is needed for gradient computation in backward pass
+        if (preActivationOutput != nullptr) {
+            // Create tensor view for z-buffer with same layout as output
+            const auto mZ = make_tensor(cute::make_gmem_ptr(preActivationOutput),
+                make_layout(cute::make_shape(M, N), cute::Stride<cute::Int<N>, cute::_1>{}));
+            const auto gZ = cute::local_tile(mZ, typename BlockGEMM::BlockTiler{}, ctaCoord,
+                cute::Step<cute::_1,cute::_1, cute::X>{});
+
+            // Compute and save pre-activation values: z = accumulator + bias
+            #pragma unroll
+            for (uint i = 0; i < trips; ++i) {
+                #pragma unroll
+                for (unsigned int j = 0; j < elems; ++j) {
+                    // Pre-activation = accumulator (after reordering) + bias
+                    // Note: accumulator here has already been reordered to striped arrangement
+                    const auto preActivation = accumulator(j + i * elems) + rB[i];
+                    gZ(rIdx + j, cIdx + i * elems) = gCStoreOp(preActivation);
+                }
+            }
+        }
+
         // Coalesced copy from registers to global memory
         #pragma unroll
         for (uint i = 0; i < trips; ++i) {
@@ -969,12 +1013,30 @@ namespace flashmoe::processor{
         static_assert(sharedSize % sizeof(Task) == 0);
         static_assert(sharedSize / sizeof(Task) >= threads);
 
+#if FLASHMOE_DEBUG
+        if (!threadIdx.x && !blockIdx.x) {
+            printf("DEBUG enqueueTask ENTER: thread=%u block=%u - about to copy to shared mem\n",
+                   threadIdx.x, blockIdx.x);
+        }
+#endif
         __shared__ uint sTask[eS];
         if (threadIdx.x < eS) {
             const auto* __restrict__ uT = CONST_CAST_TO(uint, &task);
             sTask[threadIdx.x] = uT[threadIdx.x];
         }
+#if FLASHMOE_DEBUG
+        if (!threadIdx.x && !blockIdx.x) {
+            printf("DEBUG enqueueTask: thread=%u block=%u - BEFORE __syncthreads (THIS WILL HANG if called from single thread!)\n",
+                   threadIdx.x, blockIdx.x);
+        }
+#endif
         __syncthreads();
+#if FLASHMOE_DEBUG
+        if (!threadIdx.x && !blockIdx.x) {
+            printf("DEBUG enqueueTask: thread=%u block=%u - AFTER __syncthreads (should NOT see this if hung)\n",
+                   threadIdx.x, blockIdx.x);
+        }
+#endif
 
         if (!threadIdx.x) {
             const auto taskIdx = atomicAdd(pA.tQH + task.syncIdx, 1U);
@@ -1176,6 +1238,15 @@ namespace flashmoe::processor{
                 switch (rCurrentTask.taskType) {
                     case TaskType::preGEMM: {
                         constexpr unsigned int preIndex = 0;
+                        // Compute z1 save pointer for training mode
+                        // z1 has the same layout as xM (intermediate buffer)
+                        Element* z1Save = nullptr;
+                        if constexpr (ACC::JT::value == JobType::training) {
+                            auto* xMBase = CAST_TO(Element, bookkeeping.xM());
+                            auto* cDataPtr = CAST_TO(Element, rCurrentTask.cData[preIndex]);
+                            const auto xMOffset = cDataPtr - xMBase;
+                            z1Save = bookkeeping.z1() + xMOffset;
+                        }
                         fGET<PreGEMM, ACC::P::value, ACC::H::value>(
                             CAST_TO(typename PreGEMM::MatrixDType, workspace),
                             CONST_CAST_TO(typename PreGEMM::MatrixAType, rCurrentTask.aData),
@@ -1183,7 +1254,8 @@ namespace flashmoe::processor{
                             CAST_TO(typename PreGEMM::MatrixDType, rCurrentTask.cData[preIndex]),
                             CONST_CAST_TO(typename PreGEMM::MatrixDType, rCurrentTask.dData[preIndex]),
                             rCurrentTask.M,
-                            rCurrentTask.tileIdx);
+                            rCurrentTask.tileIdx,
+                            z1Save);
                         __syncthreads();
                         if (!threadIdx.x) {
                             __threadfence();
@@ -1202,6 +1274,28 @@ namespace flashmoe::processor{
                     break;
                     case TaskType::postGEMM: {
                         constexpr unsigned int postIndex = 1;
+#if FLASHMOE_DEBUG
+                        // Verify tileIdx consistency - currentTask and rCurrentTask should match
+                        if (!threadIdx.x && !blockIdx.x) {
+                            if (currentTask.tileIdx != rCurrentTask.tileIdx) {
+                                printf("BUG DETECTED: postGEMM tileIdx mismatch! currentTask=%u rCurrentTask=%u\n",
+                                       currentTask.tileIdx, rCurrentTask.tileIdx);
+                            }
+                        }
+#endif
+                        // Compute z2 save pointer for training mode
+                        // z2 layout: [world * nLx * pEC, H]
+                        // aData points to xM (intermediate buffer from preGEMM)
+                        Element* z2Save = nullptr;
+                        if constexpr (ACC::JT::value == JobType::training) {
+                            auto* xMBase = CAST_TO(Element, bookkeeping.xM());
+                            auto* aDataPtr = CONST_CAST_TO(Element, rCurrentTask.aData);
+                            // Compute row index in xM (which has P columns)
+                            const auto xMOffset = aDataPtr - xMBase;
+                            const auto rowIdx = xMOffset / P;
+                            // z2 has H columns, so offset is rowIdx * H
+                            z2Save = bookkeeping.z2() + rowIdx * H;
+                        }
                         fGET<PostGEMM, ACC::H::value, ACC::P::value>(
                             CAST_TO(typename PostGEMM::MatrixDType, workspace),
                             CONST_CAST_TO(typename PostGEMM::MatrixAType, rCurrentTask.aData),
@@ -1209,7 +1303,8 @@ namespace flashmoe::processor{
                             CAST_TO(typename PostGEMM::MatrixDType, rCurrentTask.cData[postIndex]),
                             CONST_CAST_TO(typename PostGEMM::MatrixDType, rCurrentTask.dData[postIndex]),
                             rCurrentTask.M,
-                            rCurrentTask.tileIdx);  // was prev currentTask.tileIdx. look into this
+                            rCurrentTask.tileIdx,
+                            z2Save);  // was prev currentTask.tileIdx. look into this
                         __syncthreads();
                         if (!threadIdx.x) {
                             // Pack payload into single signal word of 8 bytes
@@ -1221,7 +1316,14 @@ namespace flashmoe::processor{
                             if (rCurrentTask.isPeerRemote) {
                                 // Remote; check if we need to do the transfer
                                 __threadfence();
-                                if (atomicIncrement(pA.tQS + rCurrentTask.syncIdx) + 1 == tN + tNx) {
+                                const auto syncCount = atomicIncrement(pA.tQS + rCurrentTask.syncIdx) + 1;
+                                if (syncCount == tN + tNx) {
+#if FLASHMOE_DEBUG
+                                    printf("DEBUG postGEMM NVSHMEM transfer rank=%d block=%u sb=%u syncIdx=%u syncCount=%u tN=%u tNx=%u tileSize=%u peer=%u\n",
+                                           nvshmem_my_pe(), blockIdx.x, rSeqBit,
+                                           rCurrentTask.syncIdx, syncCount, tN, tNx,
+                                           rCurrentTask.tileSize, rCurrentTask.peerIdx);
+#endif
                                     nvshmem_putmem_signal_nbi(rCurrentTask.rcData,
                                         rCurrentTask.cData[postIndex],
                                         // Batched remote network transfer to avoid overwhelming the NIC
@@ -1253,18 +1355,21 @@ namespace flashmoe::processor{
                             rCurrentTask.tileIdx,
                             rCurrentTask.tileSize,
                             rCurrentTask.expertIdx);
-// #if FLASHMOE_DEBUG
-//                         if (!threadIdx.x && !blockIdx.x) {
-//                             printf("DEBUG combine complete rank=%d sb=%u tile=%u tileSize=%u expert=%u peer=%u remote=%u\n",
-//                                    nvshmem_my_pe(),
-//                                    rSeqBit,
-//                                    rCurrentTask.tileIdx,
-//                                    rCurrentTask.tileSize,
-//                                    rCurrentTask.expertIdx,
-//                                    rCurrentTask.peerIdx,
-//                                    static_cast<unsigned>(rCurrentTask.isPeerRemote));
-//                         }
-// #endif
+#if FLASHMOE_DEBUG
+                        if (!threadIdx.x && !blockIdx.x) {
+                            // Sample first 4 token indices from this combine task
+                            const auto* tps = CONST_CAST_TO(TPS, rCurrentTask.aData);
+                            printf("DEBUG combine rank=%d sb=%u tile=%u tileSize=%u expert=%u peer=%u remote=%u tokenIdx[0..3]=[%u,%u,%u,%u]\n",
+                                   nvshmem_my_pe(),
+                                   rSeqBit,
+                                   rCurrentTask.tileIdx,
+                                   rCurrentTask.tileSize,
+                                   rCurrentTask.expertIdx,
+                                   rCurrentTask.peerIdx,
+                                   static_cast<unsigned>(rCurrentTask.isPeerRemote),
+                                   tps[0].tokenIdx, tps[1].tokenIdx, tps[2].tokenIdx, tps[3].tokenIdx);
+                        }
+#endif
                     }
                     break;
                     case TaskType::gradCombine: {
@@ -1496,6 +1601,12 @@ namespace flashmoe::processor{
                     }
                     break;
                     case TaskType::gradPreGEMM: {
+#if FLASHMOE_DEBUG
+                        if (!threadIdx.x && !blockIdx.x) {
+                            printf("DEBUG gradPreGEMM ENTER: block=%u tile=%u syncIdx=%u\n",
+                                   blockIdx.x, rCurrentTask.tileIdx, rCurrentTask.syncIdx);
+                        }
+#endif
                         constexpr unsigned int w1Index = 0;
                         fGET<GradPreGEMM, ACC::P::value, ACC::H::value>(
                             CAST_TO(typename GradPreGEMM::MatrixDType, workspace),
@@ -1506,6 +1617,14 @@ namespace flashmoe::processor{
                             rCurrentTask.M,
                             rCurrentTask.tileIdx);
                         __syncthreads();
+#if FLASHMOE_DEBUG
+                        if (!threadIdx.x && !blockIdx.x) {
+                            printf("DEBUG gradPreGEMM: block=%u - fGET done, about to call enqueueTask from thread 0 ONLY\n",
+                                   blockIdx.x);
+                            printf("DEBUG gradPreGEMM: WARNING - enqueueTask has __syncthreads() but only thread 0 calls it!\n");
+                        }
+#endif
+                        // Enqueue gradWeights task for this tile
                         if (!threadIdx.x) {
                             constexpr auto expertStride = 2 * P * H + P + H;
                             auto* const weightGradBuffer = CAST_TO(Element, bookkeeping.gW()) + rCurrentTask.expertIdx * expertStride;
@@ -1526,6 +1645,25 @@ namespace flashmoe::processor{
                                 rCurrentTask.isPeerRemote,
                             };
                             enqueueTask(gradWeightTask, pA);
+#if FLASHMOE_DEBUG
+                            printf("DEBUG gradPreGEMM: block=%u - enqueueTask RETURNED (should NOT see this if hung!)\n",
+                                   blockIdx.x);
+#endif
+                        }
+                        // Check if all tiles are done and create gradPostGEMM tasks
+                        // (mirrors preGEMM -> notifyNext -> postGEMM pattern)
+                        if (!threadIdx.x) {
+                            __threadfence();
+                            enqueue = atomicAdd(pA.tQS + rCurrentTask.syncIdx, 1U) + 1 == tN;
+                        }
+                        __syncthreads();
+                        if (enqueue) {
+                            if (!rCurrentTask.isPeerRemote) {
+                                notifyGradient<PeerConnectivity::p2p>(CAST_TO(uint, workspace), rCurrentTask, pA);
+                            }
+                            else {
+                                notifyGradient<PeerConnectivity::remote>(CAST_TO(uint, workspace), rCurrentTask, pA);
+                            }
                         }
                     }
                     break;

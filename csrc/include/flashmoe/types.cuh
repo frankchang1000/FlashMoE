@@ -732,6 +732,13 @@ namespace flashmoe{
         ACC::Element* routingScores = nullptr;
         ACC::Element* gradGateCombine = nullptr;
         ACC::Element* gradGateGEMM = nullptr;
+        /// z1: preGEMM output before activation (world * nLx * pEC * P)
+        ACC::Element* savedZ1 = nullptr;
+        /// z2: postGEMM output before activation (world * nLx * pEC * H)
+        ACC::Element* savedZ2 = nullptr;
+        /// saved expert counts for backward pass routing
+        /// eC is cleared at end of forward, so we save it for backward
+        BookType* savedEC = nullptr;
         unsigned long int ilt = 0U;
         unsigned int gtQCl = 0U;
         unsigned int sT = 0U;
@@ -767,6 +774,9 @@ namespace flashmoe{
             ACC::Element* const& _routingScores,
             ACC::Element* const& _gradGateCombine,
             ACC::Element* const& _gradGateGEMM,
+            ACC::Element* const& _savedZ1,
+            ACC::Element* const& _savedZ2,
+            BookType* const& _savedEC,
             const EPG& ePgD) :
                 flags(_flags),
                 sHeap(_sHeap),
@@ -786,6 +796,9 @@ namespace flashmoe{
                 routingScores(_routingScores),
                 gradGateCombine(_gradGateCombine),
                 gradGateGEMM(_gradGateGEMM),
+                savedZ1(_savedZ1),
+                savedZ2(_savedZ2),
+                savedEC(_savedEC),
                 rank(ePgD.epRank),
                 world(ePgD.epWorld),
                 nLx(ePgD.nLx),
@@ -813,10 +826,14 @@ namespace flashmoe{
             ACC::Element* const& _gradGateWeights = nullptr,
             ACC::Element* const& _routingScores = nullptr,
             ACC::Element* const& _gradGateCombine = nullptr,
-            ACC::Element* const& _gradGateGEMM = nullptr) :
+            ACC::Element* const& _gradGateGEMM = nullptr,
+            ACC::Element* const& _savedZ1 = nullptr,
+            ACC::Element* const& _savedZ2 = nullptr,
+            BookType* const& _savedEC = nullptr) :
         book(_book), bookElement(_bookElement), gradWeights(_gradWeights),
         gradGateWeights(_gradGateWeights), routingScores(_routingScores),
-        gradGateCombine(_gradGateCombine), gradGateGEMM(_gradGateGEMM){}
+        gradGateCombine(_gradGateCombine), gradGateGEMM(_gradGateGEMM),
+        savedZ1(_savedZ1), savedZ2(_savedZ2), savedEC(_savedEC){}
 
         template<unsigned int tileDimension>
         __host__ __device__ __forceinline__
@@ -1039,6 +1056,14 @@ namespace flashmoe{
         constexpr static auto gGateGEMMLt() {
             return ACC::S::value * ACC::E::value;
         }
+        /// savedEC buffer: saved expert counts for backward pass
+        __device__ __forceinline__
+        auto* sEC() const {
+            return savedEC;
+        }
+        constexpr static auto sEClt() {
+            return ACC::E::value;
+        }
         /***********CONTIGUOUS**************/
         constexpr static auto b4lt(const unsigned int& _nLx, const unsigned int& _world) {
             constexpr auto blocks = ACC::PeakHardware::OS::processorBlocks::value;
@@ -1064,6 +1089,24 @@ namespace flashmoe{
         }
         constexpr static auto xMlt() {
             return ACC::S::value * ACC::P::value;
+        }
+
+        /// z1 buffer: preGEMM pre-activation values (before first activation)
+        __device__ __forceinline__
+        auto* z1() const {
+            return savedZ1;
+        }
+        constexpr static auto z1lt(const unsigned int& _nLx, const unsigned int& _world) {
+            return _world * _nLx * ACC::pEC::value * ACC::P::value;
+        }
+
+        /// z2 buffer: postGEMM pre-activation values (before second activation)
+        __device__ __forceinline__
+        auto* z2() const {
+            return savedZ2;
+        }
+        constexpr static auto z2lt(const unsigned int& _nLx, const unsigned int& _world) {
+            return _world * _nLx * ACC::pEC::value * ACC::H::value;
         }
 
         /// Expository purposes

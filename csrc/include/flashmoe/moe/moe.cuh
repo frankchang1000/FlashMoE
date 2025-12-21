@@ -203,6 +203,18 @@ namespace flashmoe::moe{
             nvshmem_barrier_all(); // sync across ranks after gate forward
         }
         gridBarrier();
+
+        // save expert counts for backward pass before they get cleared by dispatch
+        if constexpr (ACC::JT::value == JobType::training) {
+            const auto* __restrict__ eC = bookkeeping.eC();
+            auto* __restrict__ sEC = bookkeeping.sEC();
+            const auto idx = threads * blockIdx.x + threadIdx.x;
+            for (uint i = idx; i < ACC::E::value; i += blocks * threads) {
+                sEC[i] = eC[i];
+            }
+            gridBarrier();
+        }
+
 // #if FLASHMOE_DEBUG
 //         if (!threadIdx.x && !blockIdx.x) {
 //             const auto gateCount = static_cast<size_t>(ACC::S::value) * ACC::PX::value;
@@ -400,6 +412,17 @@ namespace flashmoe::moe{
                    sb, lE, base, gP, ePu);
         }
         __syncthreads();
+
+        // restore expert counts from forward pass (saved before they were cleared)
+        {
+            const auto* __restrict__ sEC = bookkeeping.sEC();
+            auto* __restrict__ eC = bookkeeping.eC();
+            const auto idx = threads * blockIdx.x + threadIdx.x;
+            for (uint i = idx; i < ACC::E::value; i += blocks * threads) {
+                eC[i] = sEC[i];
+            }
+        }
+        gridBarrier();
 
         if constexpr (ACC::E::value > 1) {
             if (blockIdx.x + 1 < blocks) {
