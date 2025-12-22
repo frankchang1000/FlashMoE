@@ -3,7 +3,7 @@
   "drop_tokens": 1,
   "expert_top_k": 2,
   "global_batch": 256,
-  "is_training": 0,
+  "is_training": 1,
   "hidden_act": 0,
   "hidden_size": 2048,
   "intermediate_size": 2048,
