@@ -18,6 +18,7 @@ Configuration is compile-time:
 """
 
 from .ops import run_moe, get_compiled_config
+from .autograd import flashmoe_forward
 
 try:
     from . import _C
@@ -27,4 +28,4 @@ except ImportError:
 
 __version__ = '0.1.0'
 
-__all__ = ['run_moe', 'get_compiled_config']
+__all__ = ['run_moe', 'get_compiled_config', 'flashmoe_forward']

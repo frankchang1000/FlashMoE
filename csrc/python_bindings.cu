@@ -37,32 +37,28 @@ torch::Tensor moe_forward(
     constexpr auto E = flashmoe::ACC::E::value;
     constexpr auto P = flashmoe::ACC::P::value;
     constexpr auto PX = flashmoe::ACC::PX::value;
-    const auto nLx = flashmoe::hostBookkeeping.nLx;
-    
-    // Validate input dimensions match compile-time config
+    const auto nLx = static_cast<uint>(expert_weights.size(0));
+
     TORCH_CHECK(input.dim() == 3, "Input must be 3D [batch, seq, H]");
-    TORCH_CHECK(input.size(0) * input.size(1) == S, 
-                "Input batch*seq must equal compiled S=" + std::to_string(S) + 
-                ". Got batch=" + std::to_string(input.size(0)) + 
-                ", seq=" + std::to_string(input.size(1)) + 
+    TORCH_CHECK(input.size(0) * input.size(1) == S,
+                "Input batch*seq must equal compiled S=" + std::to_string(S) +
+                ". Got batch=" + std::to_string(input.size(0)) +
+                ", seq=" + std::to_string(input.size(1)) +
                 " (product=" + std::to_string(input.size(0) * input.size(1)) + ")");
-    TORCH_CHECK(input.size(2) == H, 
-                "Input hidden_size must equal compiled H=" + std::to_string(H) + 
+    TORCH_CHECK(input.size(2) == H,
+                "Input hidden_size must equal compiled H=" + std::to_string(H) +
                 ". Got " + std::to_string(input.size(2)));
     TORCH_CHECK(gate_weights.size(0) == H && gate_weights.size(1) == E,
-                "Gate weights must be [H=" + std::to_string(H) + 
-                ", E=" + std::to_string(E) + "]. Got [" + 
-                std::to_string(gate_weights.size(0)) + ", " + 
+                "Gate weights must be [H=" + std::to_string(H) +
+                ", E=" + std::to_string(E) + "]. Got [" +
+                std::to_string(gate_weights.size(0)) + ", " +
                 std::to_string(gate_weights.size(1)) + "]");
-    TORCH_CHECK(expert_weights.size(0) == nLx, 
-                "Expert count mismatch. Expected " + std::to_string(nLx) + 
-                " local experts, got " + std::to_string(expert_weights.size(0)));
-    TORCH_CHECK(expert_weights.size(1) == 2, 
+    TORCH_CHECK(expert_weights.size(1) == 2,
                 "Expert weights must have up and down projections [nLx, 2, P, H]");
     TORCH_CHECK(expert_weights.size(2) == P && expert_weights.size(3) == H,
-                "Expert weights must be [*, 2, P=" + std::to_string(P) + 
-                ", H=" + std::to_string(H) + "]. Got [*, 2, " + 
-                std::to_string(expert_weights.size(2)) + ", " + 
+                "Expert weights must be [*, 2, P=" + std::to_string(P) +
+                ", H=" + std::to_string(H) + "]. Got [*, 2, " +
+                std::to_string(expert_weights.size(2)) + ", " +
                 std::to_string(expert_weights.size(3)) + "]");
     
     // Calculate memory layout

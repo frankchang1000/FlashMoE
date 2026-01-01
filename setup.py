@@ -5,10 +5,17 @@ Compiles CUDA kernels and creates pip-installable package
 import os
 import sys
 import json
+import shutil
 from pathlib import Path
 from setuptools import setup, find_packages
 import torch
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+
+if shutil.which('ccache'):
+    os.environ.setdefault('CC', 'ccache gcc')
+    os.environ.setdefault('CXX', 'ccache g++')
+    os.environ.setdefault('CUDA_NVCC_EXECUTABLE', 'ccache nvcc')
+    print("Using ccache for C/C++ and CUDA compilation")
 
 
 # Environment variables for dependencies
@@ -205,7 +212,7 @@ def get_cuda_extensions():
             '--expt-extended-lambda',
             '-rdc=true',
             '--cudart=shared',
-            '-gencode', 'arch=compute_90,code=sm_90',  # H100 only
+            '-gencode', 'arch=compute_80,code=sm_80',  # H100 only
             '-Xcompiler', '-fPIC',
             "-Xfatbin", "-compress-all",
             '-U__CUDA_NO_HALF_OPERATORS__',
