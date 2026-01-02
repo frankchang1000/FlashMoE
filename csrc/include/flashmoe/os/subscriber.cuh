@@ -118,7 +118,8 @@ namespace flashmoe::subscriber{
                             SignalConstants::ground);
                         const auto* __restrict__ sP = CONST_CAST_TO(SignalPayload<PacketStage::initial>, &signal);
                         const bool isGradientPacket = sP->seqBit >= gradStart && sP->seqBit <= gradEnd;
-                        if (isGradientPacket || sP->seqBit == localSeqBit) {
+                        const bool isLocalGradientPass = localSeqBit >= gradStart && localSeqBit <= gradEnd;
+                        if ((isGradientPacket && isLocalGradientPass) || sP->seqBit == localSeqBit) {
                             decodeMode = isGradientPacket ? gradientDecode : forwardDecode;
                             // set visited bit
                             visitedSet.set(vIdx);
@@ -292,7 +293,8 @@ namespace flashmoe::subscriber{
                             SignalConstants::ground);
                         const auto* __restrict__ sP = CONST_CAST_TO(SignalPayload<PacketStage::last>, &signal);
                         const bool isGradientPacket = sP->seqBit >= gradStart && sP->seqBit <= gradEnd;
-                        if (isGradientPacket || sP->seqBit == localSeqBit) {
+                        const bool isLocalGradientPass = localSeqBit >= gradStart && localSeqBit <= gradEnd;
+                        if ((isGradientPacket && isLocalGradientPass) || sP->seqBit == localSeqBit) {
                             // let's decode this packet
                             // set visited bit
                             sBS.set(bIdx);
@@ -373,7 +375,8 @@ namespace flashmoe::subscriber{
                                 SignalConstants::ground);
                             const auto* __restrict__ sP = CONST_CAST_TO(SignalPayload<PacketStage::last>, &signal);
                             const bool isGradientPacket = sP->seqBit >= gradStart && sP->seqBit <= gradEnd;
-                            if (isGradientPacket || sP->seqBit == localSeqBit) {
+                            const bool isLocalGradientPass = localSeqBit >= gradStart && localSeqBit <= gradEnd;
+                            if ((isGradientPacket && isLocalGradientPass) || sP->seqBit == localSeqBit) {
                                 // set visited bit
                                 sBS.set(bIdx);
                                 // let's decode this packet
