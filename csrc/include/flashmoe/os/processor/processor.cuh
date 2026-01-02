@@ -844,6 +844,7 @@ namespace flashmoe::processor{
                     rCurrentTask.peerIdx,
                     rCurrentTask.batchIdx,
                     rCurrentTask.isPeerRemote,
+                    rCurrentTask.expertIdx,
                 };
                 // Directive to the compiler to reinterpret the Task structure as a stream of 4-byte blocks
                 const auto* __restrict__ uT = CONST_CAST_TO(uint, &nextTask);
@@ -882,6 +883,7 @@ namespace flashmoe::processor{
                     rCurrentTask.peerIdx,
                     rCurrentTask.batchIdx,
                     rCurrentTask.isPeerRemote,
+                    rCurrentTask.expertIdx,
                 };
                 // Directive to the compiler to reinterpret the Task structure as a stream of 4-byte blocks
                 const auto* __restrict__ uT = CONST_CAST_TO(uint, &nextTask);
@@ -974,6 +976,7 @@ namespace flashmoe::processor{
                     rCurrentTask.peerIdx,
                     rCurrentTask.batchIdx,
                     rCurrentTask.isPeerRemote,
+                    rCurrentTask.expertIdx,
                 };
                 const auto* __restrict__ uT = CONST_CAST_TO(uint, &nextTask);
                 #pragma unroll
@@ -1008,6 +1011,7 @@ namespace flashmoe::processor{
                     rCurrentTask.peerIdx,
                     rCurrentTask.batchIdx,
                     rCurrentTask.isPeerRemote,
+                    rCurrentTask.expertIdx,
                 };
                 const auto* __restrict__ uT = CONST_CAST_TO(uint, &nextTask);
                 #pragma unroll

@@ -623,11 +623,12 @@ namespace flashmoe{
             const uint16_t& _size,
             const unsigned int& _peerIdx,
             const unsigned int& _batchIdx,
-            const uint& _isPeerRemote):
+            const uint& _isPeerRemote,
+            const uint& _expertIdx):
         aData(_aData), bData(_bData),
         cData(_cData), dData(_dData), rcData(_rcData), flags(_flags),
         syncIdx(_syncIdx), tileIdx(_tile),  M(_M),
-        batchIdx(_batchIdx), peerIdx(_peerIdx), isPeerRemote(_isPeerRemote), taskType(_taskType), tileSize(_size){}
+        batchIdx(_batchIdx), peerIdx(_peerIdx), isPeerRemote(_isPeerRemote), expertIdx(_expertIdx), taskType(_taskType), tileSize(_size){}
 
         // Stage 2
         __device__ __forceinline__

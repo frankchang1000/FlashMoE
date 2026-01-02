@@ -477,7 +477,8 @@ namespace flashmoe::packet {
                     static_cast<uint16_t>(BLOCK_M),
                     gPeer,
                     rowIdx,
-                    p == PeerConnectivity::remote
+                    p == PeerConnectivity::remote,
+                    localExpertIdx
                 };
             }
 
@@ -499,7 +500,8 @@ namespace flashmoe::packet {
                         static_cast<uint16_t>(residue),
                         gPeer,
                         fTilesM,
-                        p == PeerConnectivity::remote
+                        p == PeerConnectivity::remote,
+                        localExpertIdx
                     };
                 }
             }
