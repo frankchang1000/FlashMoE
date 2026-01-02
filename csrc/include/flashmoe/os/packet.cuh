@@ -560,7 +560,10 @@ namespace flashmoe::packet {
             const unsigned int& expertIdx,
             const unsigned int& peerIdx,          // peer that sent the packet
             const unsigned int& localExpertIdx,   // local expert index on that peer
-            const unsigned int& batchIdx) const { // batch index from signal
+            const unsigned int& batchIdx,         // batch index from signal
+            const cuda::std::array<const cuda::std::byte*, GEMMs>& weights,
+            const cuda::std::array<const cuda::std::byte*, GEMMs>& savedActivations,
+            flagsType* const& flags) const {
             constexpr auto P = ACC::P::value;
             constexpr auto pEC = ACC::pEC::value;
             constexpr auto TCM = ACC::TCM::value;
@@ -575,14 +578,12 @@ namespace flashmoe::packet {
             const auto xMOffset = (peerIdx * dA.nLx + localExpertIdx) * pEC * P * sizeof(Element);
             auto* xMLocation = pGB + xMOffset;
 
-// #if FLASHMOE_DEBUG
-//             printf("DEBUG SPECIALIZED gradDecoder: peerIdx=%u localExp=%u nLx=%u pEC=%u P=%u xMOffset=%lu pGB=%p xMLoc=%p\n",
-//                    peerIdx, localExpertIdx, dA.nLx, pEC, P, xMOffset, pGB, xMLocation);
-// #endif
             const auto sO = TCM * (peerIdx * dA.nLx + localExpertIdx);
             const auto syncIdx = sO + (tileIdx / TN);
 
             const auto padM = Bookkeeping::pad<BLOCK_M>(nTokens);
+
+            auto* rcData = heap::advance<1, 1>(dA.sHeap, dA.epRank, localExpertIdx);
 
             Task gradTask{
                 TaskType::gradCombine,
@@ -599,6 +600,10 @@ namespace flashmoe::packet {
             gradTask.peerIdx = peerIdx;
             gradTask.batchIdx = batchIdx;
             gradTask.isPeerRemote = false;
+            gradTask.bData = weights;
+            gradTask.dData = savedActivations;  // Base pointers (unused by processor)
+            gradTask.rcData = rcData;
+            gradTask.flags = flags;
             emitTask(gradTask);
 
             Task gateTask{
@@ -686,7 +691,10 @@ namespace flashmoe::packet {
             const unsigned int& expertIdx,
             const unsigned int& peerIdx,          // peer that sent the packet
             const unsigned int& localExpertIdx,   // local expert index on that peer
-            const unsigned int& batchIdx) const { // batch index from signal
+            const unsigned int& batchIdx,         // batch index from signal
+            const cuda::std::array<const cuda::std::byte*, GEMMs>& weights,
+            const cuda::std::array<const cuda::std::byte*, GEMMs>& savedActivations,
+            flagsType* const& flags) const {
             constexpr auto P = ACC::P::value;
             constexpr auto pEC = ACC::pEC::value;
             constexpr auto TCM = ACC::TCM::value;
@@ -699,6 +707,8 @@ namespace flashmoe::packet {
             auto* xMLocation = pGB + xMOffset;
             const auto sO = TCM * (peerIdx * dA.nLx + localExpertIdx);
             const auto padM = Bookkeeping::pad<BLOCK_M>(nTokens);
+
+            auto* rcData = heap::advance<1, 1>(dA.sHeap, dA.epRank, localExpertIdx);
 
             for (uint i = 0; i < tNx; ++i) {
                 const auto syncIdx = sO + (i / TN);
@@ -717,6 +727,10 @@ namespace flashmoe::packet {
                 gradTask.peerIdx = peerIdx;
                 gradTask.batchIdx = batchIdx;
                 gradTask.isPeerRemote = true;
+                gradTask.bData = weights;
+                gradTask.dData = savedActivations;
+                gradTask.rcData = rcData;
+                gradTask.flags = flags;
                 dA.tQ[DQ::next(qIdx, i)] = gradTask;
             }
 

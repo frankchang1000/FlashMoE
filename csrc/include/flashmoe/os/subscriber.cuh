@@ -216,6 +216,8 @@ namespace flashmoe::subscriber{
         template<
             typename WorkSet,
             typename TokenIds,
+            typename ExpertsUp,
+            typename ExpertsDown,
             unsigned int TN = ACC::TNx::value,
             unsigned int CS = ACC::TCM::value * TN
         >
@@ -231,6 +233,11 @@ namespace flashmoe::subscriber{
             const uint* __restrict__ const& tileIndices,
             /// Lookup Table
             const ELI* __restrict__ const& eL,
+            const PLI* __restrict__ const& pL,
+            ExpertsUp const& expertsUp,
+            ExpertsDown const& expertsDown,
+            const cuda::std::array<const cuda::std::byte*, GEMMs>& savedActivations,
+            const unsigned int& gfSfC,
             /// State
             uint* __restrict__ const& scratch,
             flagsType* __restrict__ const& flags,
@@ -299,9 +306,16 @@ namespace flashmoe::subscriber{
                                 // enforce memory consistency
                                 eMC(sSeqBit, localSeqBit);
                                 if (isGradientPacket) {
+                                    cuda::std::array weights{
+                                        CONST_CAST_TO(cuda::std::byte, &expertsUp(lookup.localExpertIndex)),
+                                        CONST_CAST_TO(cuda::std::byte, &expertsDown(lookup.localExpertIndex))
+                                    };
+                                    auto* nFlags = dA.sFlags + gfSfC +
+                                        lookup.localExpertIndex * (ACC::TCM::value * ACC::TNx::value);
                                     gLRd(dA, pGB, packet, CONST_CAST_TO(cuda::std::byte, tI), sP->tokensM,
                                         ltQHead, tQHead, expertIdx,
-                                        lookup.epRank, lookup.localExpertIndex, sP->batchIdx);
+                                        lookup.epRank, lookup.localExpertIndex, sP->batchIdx,
+                                        weights, savedActivations, nFlags);
                                 }
                                 else {
                                     lRd(dA, packet, CONST_CAST_TO(cuda::std::byte, tI), sP->tokensM,
@@ -312,9 +326,17 @@ namespace flashmoe::subscriber{
                                 // enforce memory consistency
                                 __threadfence_system();
                                 if (isGradientPacket) {
+                                    cuda::std::array weights{
+                                        CONST_CAST_TO(cuda::std::byte, &expertsUp(lookup.localExpertIndex)),
+                                        CONST_CAST_TO(cuda::std::byte, &expertsDown(lookup.localExpertIndex))
+                                    };
+                                    // Compute flags pointer for signaling back
+                                    auto* nFlags = pLI.remoteSFlags + gfSfC +
+                                        lookup.localExpertIndex * (ACC::TCM::value * ACC::TNx::value);
                                     gLPd(dA, pGB, dA.tQ, ltQHead, packet, CONST_CAST_TO(cuda::std::byte, tI),
                                         sP->tokensM, flagIdx % TN, tQHead, expertIdx,
-                                        lookup.epRank, lookup.localExpertIndex, sP->batchIdx);
+                                        lookup.epRank, lookup.localExpertIndex, sP->batchIdx,
+                                        weights, savedActivations, nFlags);
                                 }
                                 else {
                                     lPd(dA.tQ, ltQHead, packet, CONST_CAST_TO(cuda::std::byte, tI),
@@ -393,9 +415,16 @@ namespace flashmoe::subscriber{
                                     // enforce memory consistency
                                     eMC(sSeqBit, localSeqBit);
                                     if (isGradientPacket) {
+                                        cuda::std::array weights{
+                                            CONST_CAST_TO(cuda::std::byte, &expertsUp(lookup.localExpertIndex)),
+                                            CONST_CAST_TO(cuda::std::byte, &expertsDown(lookup.localExpertIndex))
+                                        };
+                                        auto* nFlags = dA.sFlags + gfSfC +
+                                            lookup.localExpertIndex * (ACC::TCM::value * ACC::TNx::value);
                                         gLRd(dA, pGB, packet, CONST_CAST_TO(cuda::std::byte, tI), sP->tokensM,
                                             ltQHead, tQHead, expertIdx,
-                                            lookup.epRank, lookup.localExpertIndex, sP->batchIdx);
+                                            lookup.epRank, lookup.localExpertIndex, sP->batchIdx,
+                                            weights, savedActivations, nFlags);
                                     }
                                     else {
                                         lRd(dA, packet, CONST_CAST_TO(cuda::std::byte, tI), sP->tokensM,
@@ -406,10 +435,18 @@ namespace flashmoe::subscriber{
                                     // enforce memory consistency
                                     __threadfence_system();
                                     if (isGradientPacket) {
+                                        cuda::std::array weights{
+                                            CONST_CAST_TO(cuda::std::byte, &expertsUp(lookup.localExpertIndex)),
+                                            CONST_CAST_TO(cuda::std::byte, &expertsDown(lookup.localExpertIndex))
+                                        };
+                                        const auto pLI = pL[lookup.epRank];
+                                        auto* nFlags = pLI.remoteSFlags + gfSfC +
+                                            lookup.localExpertIndex * (ACC::TCM::value * ACC::TNx::value);
                                         gLPd(dA, pGB, dA.tQ, ltQHead, packet,
                                             CONST_CAST_TO(cuda::std::byte, tI),
                                             sP->tokensM, flagIdx % TN, tQHead, expertIdx,
-                                            lookup.epRank, lookup.localExpertIndex, sP->batchIdx);
+                                            lookup.epRank, lookup.localExpertIndex, sP->batchIdx,
+                                            weights, savedActivations, nFlags);
                                     }
                                     else {
                                         lPd(dA.tQ, ltQHead, packet,
@@ -537,6 +574,11 @@ namespace flashmoe::subscriber{
                 tokenIds,
                 tileIndices,
                 eL,
+                pL,
+                expertsUp,
+                expertsDown,
+                savedActivations,
+                gfSfC,
                 workspace,
                 flags,
                 pGB,
