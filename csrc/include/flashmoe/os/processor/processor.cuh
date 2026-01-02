@@ -1124,38 +1124,70 @@ namespace flashmoe::processor{
             cute::Layout<cute::Shape<cute::Int<K>, cute::Int<N>>,
                 cute::Stride<cute::Int<N>, cute::_1>>{});
 
-        if (!threadIdx.x && !blockIdx.x) {
-            printf("DEBUG computeWeightGradients ENTRY: expert=%u tileSize=%u K=%u N=%u bM=%u\n",
-                   expertIdx, tileSize, K, N, bM);
-            printf("DEBUG computeWeightGradients: act[0]=%.6f grad[0]=%.6f buffer[0]=%.6f\n",
+#if FLASHMOE_DEBUG
+        if (!threadIdx.x && blockIdx.x < 2) {
+            printf("DEBUG computeWeightGradients ENTRY: block=%u expert=%u tileSize=%u K=%u N=%u bM=%u threads=%u\n",
+                   blockIdx.x, expertIdx, tileSize, K, N, bM, threads);
+            printf("DEBUG computeWeightGradients PTRS: act=%p grad=%p buffer=%p\n",
+                   activations, gradients, weightGradBuffer);
+            printf("DEBUG computeWeightGradients INPUT: act[0]=%.6f grad[0]=%.6f buffer[0]=%.6f\n",
                    static_cast<float>(activations[0]), static_cast<float>(gradients[0]),
                    static_cast<float>(weightGradBuffer[0]));
         }
+#endif
+        constexpr uint totalKN = K * N;
+        constexpr uint elemsPerThread = (totalKN + threads - 1) / threads;
 
-        #pragma unroll
-        for (uint m = 0; m < bM; ++m) {
-            if (m < tileSize) {
-                #pragma unroll
-                for (uint k = 0; k < K; ++k) {
-                    const auto actVal = mAct(m, k);
-                    #pragma unroll
-                    for (uint n = 0; n < N; ++n) {
-                        const auto gradVal = mGrad(m, n);
-                        using ProdT = decltype(actVal * gradVal);
-                        using NativeElement = typename ToCDx<Element>::T;
-                        constexpr auto convert = cutlass::NumericConverter<NativeElement, ProdT>{};
-                        auto* nativePtr = CAST_TO(NativeElement, &mWGrad(k, n));
-                        atomicAdd(nativePtr, convert(actVal * gradVal));
-                    }
-                }
+#if FLASHMOE_DEBUG
+        if (!threadIdx.x && blockIdx.x < 2) {
+            printf("DEBUG computeWeightGradients WORK: totalKN=%u elemsPerThread=%u\n",
+                   totalKN, elemsPerThread);
+        }
+#endif
+
+        using NativeElement = typename ToCDx<Element>::T;
+        constexpr auto convert = cutlass::NumericConverter<NativeElement, Element>{};
+
+        const uint startIdx = threadIdx.x * elemsPerThread;
+        const uint endIdx = min(startIdx + elemsPerThread, totalKN);
+
+#if FLASHMOE_DEBUG
+        Element debugSum{0};
+        bool isDebugThread = (threadIdx.x == 0 && blockIdx.x == 0);
+#endif
+
+        for (uint idx = startIdx; idx < endIdx; ++idx) {
+            const uint k = idx / N;
+            const uint n = idx % N;
+
+            Element sum{0};
+            for (uint m = 0; m < tileSize; ++m) {
+                sum += mAct(m, k) * mGrad(m, n);
             }
+
+            auto* nativePtr = CAST_TO(NativeElement, &mWGrad(k, n));
+            atomicAdd(nativePtr, convert(sum));
+
+#if FLASHMOE_DEBUG
+            if (isDebugThread && idx == startIdx) {
+                debugSum = sum;
+            }
+#endif
         }
 
         __syncthreads();
-        if (!threadIdx.x && !blockIdx.x) {
-            printf("DEBUG computeWeightGradients EXIT: expert=%u buffer[0]=%.6f\n",
-                   expertIdx, static_cast<float>(weightGradBuffer[0]));
+
+#if FLASHMOE_DEBUG
+        if (!threadIdx.x && blockIdx.x < 2) {
+            printf("DEBUG computeWeightGradients EXIT: block=%u expert=%u buffer[0]=%.6f firstSum=%.6f startIdx=%u endIdx=%u\n",
+                   blockIdx.x, expertIdx, static_cast<float>(weightGradBuffer[0]),
+                   static_cast<float>(debugSum), startIdx, endIdx);
         }
+        if (threadIdx.x == threads - 1 && blockIdx.x < 2) {
+            printf("DEBUG computeWeightGradients LAST_THREAD: block=%u thread=%u startIdx=%u endIdx=%u elemsComputed=%u\n",
+                   blockIdx.x, threadIdx.x, startIdx, endIdx, endIdx - startIdx);
+        }
+#endif
     }
 
     template<
