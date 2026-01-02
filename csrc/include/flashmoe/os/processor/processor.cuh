@@ -1498,11 +1498,11 @@ namespace flashmoe::processor{
                             rCurrentTask.tileIdx,
                             rCurrentTask.tileSize,
                             rCurrentTask.expertIdx);
-#if FLASHMOE_DEBUG
-                        if (!threadIdx.x) {
-                            printf("DEBUG gradCombine DONE: block=%u tile=%u\n", blockIdx.x, rCurrentTask.tileIdx);
-                        }
-#endif
+// #if FLASHMOE_DEBUG
+//                         if (!threadIdx.x) {
+//                             printf("DEBUG gradCombine DONE: block=%u tile=%u\n", blockIdx.x, rCurrentTask.tileIdx);
+//                         }
+// #endif
 // #if FLASHMOE_DEBUG
 //                         if (!threadIdx.x && !blockIdx.x) {
 //                             printf("DEBUG gradCombine split sb=%u tile=%u tileSize=%u expert=%u peer=%u remote=%u\n",
@@ -1700,16 +1700,15 @@ namespace flashmoe::processor{
                         }
 #endif
                         constexpr unsigned int w2Index = 1;
-                        // Compute z2 offset for saved activation (same layout as forward postGEMM)
-                        // z2 was stored at offset computed from aData (preGEMM output in xM)
+                        constexpr unsigned int w1Index = 0;
                         const Element* z2Activation = nullptr;
                         long long xMOffset2 = 0;
                         long long rowIdx2 = 0;
                         {
                             auto* xMBase = CAST_TO(Element, bookkeeping.xM());
-                            auto* aDataPtr = CONST_CAST_TO(Element, rCurrentTask.aData);
+                            auto* xMPtr = CAST_TO(Element, rCurrentTask.cData[w1Index]);
                             // Compute row index in xM (which has P columns)
-                            xMOffset2 = aDataPtr - xMBase;
+                            xMOffset2 = xMPtr - xMBase;
                             rowIdx2 = xMOffset2 / P;
                             // z2 has H columns, so offset is rowIdx * H
                             z2Activation = bookkeeping.z2() + rowIdx2 * H;
@@ -1717,9 +1716,9 @@ namespace flashmoe::processor{
 #if FLASHMOE_DEBUG
                         if (!threadIdx.x && blockIdx.x < 3) {
                             auto* z2Base = bookkeeping.z2();
-                            printf("DEBUG gradPostGEMM ENTER block=%u tile=%u M=%u: xMOffset=%lld rowIdx=%lld z2Base=%p z2Act=%p aData=%p\n",
+                            printf("DEBUG gradPostGEMM ENTER block=%u tile=%u M=%u: xMOffset=%lld rowIdx=%lld z2Base=%p z2Act=%p cData[0]=%p\n",
                                    blockIdx.x, rCurrentTask.tileIdx, rCurrentTask.M,
-                                   xMOffset2, rowIdx2, z2Base, z2Activation, rCurrentTask.aData);
+                                   xMOffset2, rowIdx2, z2Base, z2Activation, rCurrentTask.cData[w1Index]);
                         }
 #endif
                         fGET<GradPostGEMM, ACC::H::value, ACC::P::value>(

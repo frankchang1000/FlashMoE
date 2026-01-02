@@ -234,6 +234,7 @@ namespace flashmoe::subscriber{
             /// State
             uint* __restrict__ const& scratch,
             flagsType* __restrict__ const& flags,
+            cuda::std::byte* __restrict__ const& pGB, /*post GEMM buffer for gradient*/
             BookType* __restrict__ tQHead,
             uint& ltQHead,
             /// Constants
@@ -246,9 +247,9 @@ namespace flashmoe::subscriber{
             static_assert(WorkSet::kElements == 16 || WorkSet::kElements % bSw == 0);
             constexpr packet::Decoder<PacketStage::last, PeerConnectivity::p2p> lPd{};
             constexpr packet::Decoder<PacketStage::last, PeerConnectivity::remote> lRd{};
-            constexpr packet::Decoder<PacketStage::last, PeerConnectivity::p2p, void,
+            constexpr packet::Decoder<PacketStage::last, PeerConnectivity::p2p, ACC::Element,
                 JobMode::gradient> gLPd{};
-            constexpr packet::Decoder<PacketStage::last, PeerConnectivity::remote, void,
+            constexpr packet::Decoder<PacketStage::last, PeerConnectivity::remote, ACC::Element,
                 JobMode::gradient> gLRd{};
             constexpr uint16_t gradStart = static_cast<uint16_t>(SignalConstants::gradSequenceStart);
             constexpr uint16_t gradEnd = gradStart + 2;
@@ -298,8 +299,9 @@ namespace flashmoe::subscriber{
                                 // enforce memory consistency
                                 eMC(sSeqBit, localSeqBit);
                                 if (isGradientPacket) {
-                                    gLRd(dA, packet, CONST_CAST_TO(cuda::std::byte, tI), sP->tokensM,
-                                        ltQHead, tQHead, expertIdx);
+                                    gLRd(dA, pGB, packet, CONST_CAST_TO(cuda::std::byte, tI), sP->tokensM,
+                                        ltQHead, tQHead, expertIdx,
+                                        lookup.epRank, lookup.localExpertIndex, sP->batchIdx);
                                 }
                                 else {
                                     lRd(dA, packet, CONST_CAST_TO(cuda::std::byte, tI), sP->tokensM,
@@ -310,8 +312,9 @@ namespace flashmoe::subscriber{
                                 // enforce memory consistency
                                 __threadfence_system();
                                 if (isGradientPacket) {
-                                    gLPd(dA.tQ, ltQHead, packet, CONST_CAST_TO(cuda::std::byte, tI),
-                                        sP->tokensM, flagIdx % TN, tQHead, expertIdx);
+                                    gLPd(dA, pGB, dA.tQ, ltQHead, packet, CONST_CAST_TO(cuda::std::byte, tI),
+                                        sP->tokensM, flagIdx % TN, tQHead, expertIdx,
+                                        lookup.epRank, lookup.localExpertIndex, sP->batchIdx);
                                 }
                                 else {
                                     lPd(dA.tQ, ltQHead, packet, CONST_CAST_TO(cuda::std::byte, tI),
@@ -390,8 +393,9 @@ namespace flashmoe::subscriber{
                                     // enforce memory consistency
                                     eMC(sSeqBit, localSeqBit);
                                     if (isGradientPacket) {
-                                        gLRd(dA, packet, CONST_CAST_TO(cuda::std::byte, tI), sP->tokensM,
-                                            ltQHead, tQHead, expertIdx);
+                                        gLRd(dA, pGB, packet, CONST_CAST_TO(cuda::std::byte, tI), sP->tokensM,
+                                            ltQHead, tQHead, expertIdx,
+                                            lookup.epRank, lookup.localExpertIndex, sP->batchIdx);
                                     }
                                     else {
                                         lRd(dA, packet, CONST_CAST_TO(cuda::std::byte, tI), sP->tokensM,
@@ -402,9 +406,10 @@ namespace flashmoe::subscriber{
                                     // enforce memory consistency
                                     __threadfence_system();
                                     if (isGradientPacket) {
-                                        gLPd(dA.tQ, ltQHead, packet,
+                                        gLPd(dA, pGB, dA.tQ, ltQHead, packet,
                                             CONST_CAST_TO(cuda::std::byte, tI),
-                                            sP->tokensM, flagIdx % TN, tQHead, expertIdx);
+                                            sP->tokensM, flagIdx % TN, tQHead, expertIdx,
+                                            lookup.epRank, lookup.localExpertIndex, sP->batchIdx);
                                     }
                                     else {
                                         lPd(dA.tQ, ltQHead, packet,
@@ -534,6 +539,7 @@ namespace flashmoe::subscriber{
                 eL,
                 workspace,
                 flags,
+                pGB,
                 tQHead,
                 ltQHead,
                 ssL,
