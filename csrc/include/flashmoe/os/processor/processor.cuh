@@ -1806,6 +1806,12 @@ namespace flashmoe::processor{
                             if (!threadIdx.x && blockIdx.x < 3) {
                                 printf("DEBUG gradWeights PTRS: block=%u tokenOffset=%u heapPtr=%p origInput=%p aData=%p\n",
                                        blockIdx.x, tokenOffset, heapPtr, originalInput, rCurrentTask.aData);
+                                // const auto* heapCell0 = heap::advance<0, 0>(bookkeeping.sHeap, peer, localExpertIdx, tokenOffset);
+                                // const auto* heapCell1 = heapPtr; // already cell 1
+                                // const auto* val0 = CONST_CAST_TO(Element, heapCell0);
+                                // const auto* val1 = CONST_CAST_TO(Element, heapCell1);
+                                // printf("DEBUG BWD_HEAP_COMPARE: block=%u peer=%u expert=%u token=%u cell0=%p val0[0]=%.6f cell1=%p val1[0]=%.6f\n",
+                                //        blockIdx.x, peer, localExpertIdx, tokenOffset, heapCell0, static_cast<float>(val0[0]), heapCell1, static_cast<float>(val1[0]));
                             }
 
                             constexpr auto expertStride = 2 * P * H + P + H;

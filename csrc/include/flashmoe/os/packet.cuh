@@ -117,6 +117,12 @@ namespace flashmoe::packet {
                 auto* __restrict__ peerHeap = lI.isRemote ?
                     heap::advance<0, 0>(sHeap, lI.peer, lI.expertLocalIdx) :
                 heap::advance<0, 1>(lI.remoteSHeap, epRank, lI.expertLocalIdx);
+#if FLASHMOE_DEBUG
+                if (!threadIdx.x && !blockIdx.x && expertIdx == 0 && !lBid) {
+                    printf("DEBUG FWD_HEAP: rank=%d expert=%u isRemote=%u peerHeap=%p remoteSHeap=%p sHeap=%p epRank=%u peer=%u\n",
+                           nvshmem_my_pe(), expertIdx, lI.isRemote ? 1U : 0U, peerHeap, lI.remoteSHeap, sHeap, epRank, lI.peer);
+                }
+#endif
                 if (routedTokens) {
                     const auto partition = routedTokens / superBlockSize +
                         (lBid < routedTokens % superBlockSize);
@@ -184,24 +190,26 @@ namespace flashmoe::packet {
                             }
                         }
                         // Communicate these tokens
-                        #pragma unroll
-                        for (uint k = 0; k < batch; ++k) {
-                            const auto tokenIdx = rTID[k];
-                            const auto intraIdx = lBid + (k + j * batch) * superBlockSize;
-                            auto* __restrict__ localPH = peerHeap + intraIdx * H * sizeof(Element);
-                            const auto* __restrict__ aP = CONST_CAST_TO(NativeElement, &activations(tokenIdx, 0));
-                            // coalesced copy
-                            constexpr auto tL = H / threads;
-                            auto* __restrict__ nPH = CAST_TO(NativeElement, localPH);
+                        if (!isGradientSeq) {
                             #pragma unroll
-                            for (uint l = 0; l < tL; ++l) {
-                                const auto idx = threadIdx.x + l * threads;
-                                nPH[idx] = __ldg(aP + idx);
-                            }
-                            if constexpr (H % threads != 0) {
-                                if (threadIdx.x < H % threads) {
-                                    const auto idx = threadIdx.x + tL * threads;
+                            for (uint k = 0; k < batch; ++k) {
+                                const auto tokenIdx = rTID[k];
+                                const auto intraIdx = lBid + (k + j * batch) * superBlockSize;
+                                auto* __restrict__ localPH = peerHeap + intraIdx * H * sizeof(Element);
+                                const auto* __restrict__ aP = CONST_CAST_TO(NativeElement, &activations(tokenIdx, 0));
+                                // coalesced copy
+                                constexpr auto tL = H / threads;
+                                auto* __restrict__ nPH = CAST_TO(NativeElement, localPH);
+                                #pragma unroll
+                                for (uint l = 0; l < tL; ++l) {
+                                    const auto idx = threadIdx.x + l * threads;
                                     nPH[idx] = __ldg(aP + idx);
+                                }
+                                if constexpr (H % threads != 0) {
+                                    if (threadIdx.x < H % threads) {
+                                        const auto idx = threadIdx.x + tL * threads;
+                                        nPH[idx] = __ldg(aP + idx);
+                                    }
                                 }
                             }
                         }
@@ -220,24 +228,26 @@ namespace flashmoe::packet {
                                 rTID[k] = sC(threadIdx.x, k);
                             }
                         }
-                        #pragma unroll
-                        for (uint k = 0; k < batch; ++k) {
-                            if (k < residue) {
-                                const auto tokenIdx = rTID[k];
-                                const auto intraIdx = lBid + (k + trips * batch) * superBlockSize;
-                                auto* __restrict__ localPH = peerHeap + intraIdx * H * sizeof(Element);
-                                const auto* __restrict__ aP = CONST_CAST_TO(NativeElement, &activations(tokenIdx, 0));
-                                auto* __restrict__ nPH = CAST_TO(NativeElement, localPH);
-                                constexpr auto tL = H / threads;
-                                #pragma unroll
-                                for (uint l = 0; l < tL; ++l) {
-                                    const auto idx = threadIdx.x + l * threads;
-                                    nPH[idx] = __ldg(aP + idx);
-                                }
-                                if constexpr (H % threads != 0) {
-                                    if (threadIdx.x < H % threads) {
-                                        const auto idx = threadIdx.x + tL * threads;
+                        if (!isGradientSeq) {
+                            #pragma unroll
+                            for (uint k = 0; k < batch; ++k) {
+                                if (k < residue) {
+                                    const auto tokenIdx = rTID[k];
+                                    const auto intraIdx = lBid + (k + trips * batch) * superBlockSize;
+                                    auto* __restrict__ localPH = peerHeap + intraIdx * H * sizeof(Element);
+                                    const auto* __restrict__ aP = CONST_CAST_TO(NativeElement, &activations(tokenIdx, 0));
+                                    auto* __restrict__ nPH = CAST_TO(NativeElement, localPH);
+                                    constexpr auto tL = H / threads;
+                                    #pragma unroll
+                                    for (uint l = 0; l < tL; ++l) {
+                                        const auto idx = threadIdx.x + l * threads;
                                         nPH[idx] = __ldg(aP + idx);
+                                    }
+                                    if constexpr (H % threads != 0) {
+                                        if (threadIdx.x < H % threads) {
+                                            const auto idx = threadIdx.x + tL * threads;
+                                            nPH[idx] = __ldg(aP + idx);
+                                        }
                                     }
                                 }
                             }
@@ -433,7 +443,7 @@ namespace flashmoe::packet {
             const auto sO = ACC::TCM::value * (peer * dA.nLx + localExpertIdx);
             cuda::std::array<cuda::std::byte*, GEMMs> taskResults{};
             // Staging buffer for results of preGEMM
-            taskResults[0] = pGB + (peer * dA.nLx * ACC::pEC::value * ACC::P::value * sizeof(Element));
+            taskResults[0] = pGB + ((peer * dA.nLx + localExpertIdx) * ACC::pEC::value * ACC::P::value * sizeof(Element));
             // Egress packet buffer
             auto* rcData = heap::advance<1, 1>(sHeap, dA.epRank, localExpertIdx);
             taskResults[1] = p == PeerConnectivity::remote ?
@@ -444,6 +454,12 @@ namespace flashmoe::packet {
             const auto lS = tN / WARP_SIZE + (rT > 0 ? laneId < rT : 0);
             const auto tSlice = fS + (routedTokens % BLOCK_M == 0 ? 0 : lS);
 
+#if FLASHMOE_DEBUG
+            if (laneId == 0 && localExpertIdx == 0 && routedTokens > 0) {
+                printf("DEBUG DECODER_RANKS: rank=%d peer(EP)=%u gPeer(global)=%u epRank=%u routedTokens=%u\n",
+                       nvshmem_my_pe(), peer, gPeer, dA.epRank, routedTokens);
+            }
+#endif
             for (uint i = 0; i < fS; ++i) {
                 const auto tileIdx = laneId + i * WARP_SIZE;
                 const auto rowIdx = tileIdx / tN;

@@ -331,6 +331,7 @@ namespace flashmoe::subscriber{
                                         CONST_CAST_TO(cuda::std::byte, &expertsDown(lookup.localExpertIndex))
                                     };
                                     // Compute flags pointer for signaling back
+                                    const auto pLI = pL[lookup.epRank];
                                     auto* nFlags = pLI.remoteSFlags + gfSfC +
                                         lookup.localExpertIndex * (ACC::TCM::value * ACC::TNx::value);
                                     gLPd(dA, pGB, dA.tQ, ltQHead, packet, CONST_CAST_TO(cuda::std::byte, tI),
