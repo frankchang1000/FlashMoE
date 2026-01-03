@@ -1343,8 +1343,8 @@ namespace flashmoe::processor{
                 // Log gradient task types being processed and check for corruption
                 if (!threadIdx.x && blockIdx.x < 3) {
                     const auto taskTypeVal = static_cast<unsigned>(rCurrentTask.taskType);
-                    if (taskTypeVal > 8) {
-                        printf("DEBUG processor CORRUPT_TASK: block=%u type=%u (INVALID>8!) syncIdx=%u tileIdx=%u batchIdx=%u aData=%p\n",
+                    if (taskTypeVal > 9) {
+                        printf("DEBUG processor CORRUPT_TASK: block=%u type=%u (INVALID>9!) syncIdx=%u tileIdx=%u batchIdx=%u aData=%p\n",
                                blockIdx.x, taskTypeVal, rCurrentTask.syncIdx, rCurrentTask.tileIdx,
                                rCurrentTask.batchIdx, rCurrentTask.aData);
                     } else if (taskTypeVal >= 3) { // gradient tasks start at 3 (gradPreGEMM)
@@ -1971,6 +1971,54 @@ namespace flashmoe::processor{
                             CAST_TO(Element, rCurrentTask.rcData),
                             rCurrentTask.tileSize,
                             rCurrentTask.expertIdx);
+                    }
+                    break;
+                    case TaskType::gradInputCombine: {
+                        // accumulate grad_input from expert computation back to token positions
+                        // no probability scaling needed - gradCombine already applied it
+                        constexpr auto H = ACC::H::value;
+                        constexpr auto threads = ACC::PeakHardware::OS::threads::value;
+
+                        const auto tileSize = rCurrentTask.tileSize;
+                        // aData already points to this tile's TPS
+                        const auto* __restrict__ tokenIds = CONST_CAST_TO(TPS, rCurrentTask.aData);
+
+                        // Source: grad_input from xM (P2P: cData[0]) or heap (remote: cData[1])
+                        const auto* __restrict__ gradInputSrc = CONST_CAST_TO(Element,
+                            rCurrentTask.isPeerRemote ? rCurrentTask.cData[1] : rCurrentTask.cData[0]);
+
+                        // Destination: global gradInputBasePtr
+                        auto* __restrict__ gradInputDst = flashmoe::moe::gradInputBasePtr;
+
+                        using NativeElement = typename ToCDx<Element>::T;
+                        constexpr auto convertNative = cutlass::NumericConverter<NativeElement, Element>{};
+
+                        // Load TPS to shared memory for coalesced access
+                        auto* __restrict__ sTPS = CAST_TO(TPS, workspace);
+                        if (threadIdx.x < tileSize) {
+                            sTPS[threadIdx.x] = tokenIds[threadIdx.x];
+                        }
+                        __syncthreads();
+
+                        // Parallel scatter-accumulate
+                        for (uint t = 0; t < tileSize; ++t) {
+                            const auto tokenIdx = sTPS[t].tokenIdx;
+                            auto* __restrict__ const dstRow = gradInputDst + tokenIdx * H;
+                            const auto* __restrict__ const srcRow = gradInputSrc + t * H;
+                            for (uint h = threadIdx.x; h < H; h += threads) {
+                                const auto srcVal = srcRow[h];
+                                atomicAdd(CAST_TO(NativeElement, dstRow + h), convertNative(srcVal));
+                            }
+                        }
+                        __syncthreads();
+#if FLASHMOE_DEBUG
+                        if (!threadIdx.x && blockIdx.x < 3) {
+                            printf("DEBUG gradInputCombine rank=%d block=%u tile=%u tileSize=%u expert=%u peer=%u remote=%u tokenIdx[0]=%u src=%p dst=%p\n",
+                                   nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx, tileSize, rCurrentTask.expertIdx,
+                                   rCurrentTask.peerIdx, static_cast<unsigned>(rCurrentTask.isPeerRemote),
+                                   sTPS[0].tokenIdx, gradInputSrc, gradInputDst);
+                        }
+#endif
                     }
                     break;
                 }

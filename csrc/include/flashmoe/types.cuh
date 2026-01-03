@@ -557,7 +557,8 @@ namespace flashmoe{
         gradWeights,     // compute weight gradients
         gradCombine,     // distribute gradients to experts
         gradGateCombine, // routing gradient aggregation
-        gradGateGEMM     // gate weight and input gradients
+        gradGateGEMM,    // gate weight and input gradients
+        gradInputCombine // accumulate grad_input from experts to token positions
     };
 
     enum class EP {

@@ -649,6 +649,27 @@ namespace flashmoe::packet {
             gateTask.batchIdx = batchIdx;
             gateTask.isPeerRemote = false;
             emitTask(gateTask);
+
+            // For remote experts (gradPreGEMM completion signals), create gradInputCombine
+            // Local experts have peerIdx == epRank (initial backward signal)
+            // Remote experts have peerIdx != epRank (gradPreGEMM completion signal)
+            if (peerIdx != dA.epRank) {
+                Task inputTask{
+                    TaskType::gradInputCombine,
+                    tokenIndices,                    // aData: TPS array
+                    cuda::std::array<const cuda::std::byte*, GEMMs>{},
+                    nTokens,
+                    tileIdx,
+                    expertIdx
+                };
+                inputTask.cData[0] = xMLocation;     // Source: grad_input from xM (P2P accessible)
+                inputTask.syncIdx = syncIdx;
+                inputTask.M = padM;
+                inputTask.peerIdx = peerIdx;
+                inputTask.batchIdx = batchIdx;
+                inputTask.isPeerRemote = false;      // P2P accessible
+                emitTask(inputTask);
+            }
         }
     };
 
@@ -782,7 +803,34 @@ namespace flashmoe::packet {
                 dA.tQ[gateIdx] = gateTask;
             }
 
-            constexpr auto totalTasks = tNx * 2U;
+            // For remote experts (gradPreGEMM completion signals), create gradInputCombine
+            // Local experts have peerIdx == epRank (initial backward signal)
+            // Remote experts have peerIdx != epRank (gradPreGEMM completion signal)
+            const bool isRemoteExpert = (peerIdx != dA.epRank);
+            if (isRemoteExpert) {
+                for (uint i = 0; i < tNx; ++i) {
+                    const auto inputIdx = DQ::next(qIdx, 2 * tNx + i);
+                    const auto inputSyncIdx = sO + (i / TN);
+                    Task inputTask{
+                        TaskType::gradInputCombine,
+                        tokenIndices,
+                        cuda::std::array<const cuda::std::byte*, GEMMs>{},
+                        nTokens,
+                        i,
+                        expertIdx
+                    };
+                    inputTask.cData[0] = xMLocation;
+                    inputTask.cData[1] = const_cast<cuda::std::byte*>(packet);  // heap location
+                    inputTask.syncIdx = inputSyncIdx;
+                    inputTask.M = padM;
+                    inputTask.peerIdx = peerIdx;
+                    inputTask.batchIdx = batchIdx;
+                    inputTask.isPeerRemote = true;
+                    dA.tQ[inputIdx] = inputTask;
+                }
+            }
+
+            const auto totalTasks = isRemoteExpert ? tNx * 3U : tNx * 2U;
             lTQHead += totalTasks;
             __threadfence();
             atomicAdd_block(tQHead, totalTasks);
