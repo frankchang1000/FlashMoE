@@ -530,9 +530,12 @@ namespace flashmoe::packet {
                 TaskType::combine : TaskType::gradCombine;
             constexpr auto isGradient = m == JobMode::gradient;
             const auto emitTask = [&](const Task& task) {
-                tQ[DQ::sNext(lTQHead++)] = task;
-                __threadfence();
-                atomicIncrement<cuda::thread_scope_block>(tQHead);
+                // Fix: Multiple blocks may share tQHead[tIdx]. Use device-scoped atomic
+                // for unique slot reservation across all blocks. Visibility ordering:
+                // atomicAdd → write → fence ensures task is visible when count is read.
+                const auto slot = atomicAdd(tQHead, 1U);
+                tQ[DQ::sNext(slot)] = task;
+                __threadfence_system();
             };
 
             Task gradTask{
@@ -588,9 +591,12 @@ namespace flashmoe::packet {
             constexpr auto TN = ACC::TN::value;
 
             const auto emitTask = [&](const Task& task) {
-                tQ[DQ::sNext(lTQHead++)] = task;
-                __threadfence();
-                atomicIncrement<cuda::thread_scope_block>(tQHead);
+                // Fix: Multiple blocks may share tQHead[tIdx]. Use device-scoped atomic
+                // for unique slot reservation across all blocks. Visibility ordering:
+                // atomicAdd → write → fence ensures task is visible when count is read.
+                const auto slot = atomicAdd(tQHead, 1U);
+                tQ[DQ::sNext(slot)] = task;
+                __threadfence_system();
             };
 
             const auto xMOffset = (peerIdx * dA.nLx + localExpertIdx) * pEC * P * sizeof(Element);
@@ -622,6 +628,10 @@ namespace flashmoe::packet {
             gradTask.dData = savedActivations;  // Base pointers (unused by processor)
             gradTask.rcData = rcData;
             gradTask.flags = flags;
+// #if FLASHMOE_DEBUG
+//             printf("DEBUG gLPd DECODE: expert=%u localExpert=%u peer=%u syncIdx=%u tileIdx=%u flags=%p batchIdx=%u\n",
+//                    expertIdx, localExpertIdx, peerIdx, syncIdx, tileIdx, flags, batchIdx);
+// #endif
             emitTask(gradTask);
 
             Task gateTask{
