@@ -939,15 +939,17 @@ namespace flashmoe::processor{
         static_assert(capacity % threads == 0);
         constexpr auto elems = capacity * eS / threads;
 
+        const auto offset = ACC::TNx::value * rCurrentTask.batchIdx;
+        const auto ptQOffset = rCurrentTask.syncIdx * ACC::TNx::value;
+        auto* __restrict__ tQ = CAST_TO(uint, pA.ptQ + ptQOffset);
 #if FLASHMOE_DEBUG
         if (!threadIdx.x && blockIdx.x < 2) {
-            printf("DEBUG notifyGradientImpl ENTER: block=%u TaskT=%u tasks=%u batchIdx=%u syncIdx=%u cData[0]=%p ptQ=%p\n",
+            printf("DEBUG notifyGradientImpl ENTER: block=%u TaskT=%u tasks=%u batchIdx=%u syncIdx=%u "
+                   "ptQ=%p ptQ_offset=%u write_addr=%p\n",
                    blockIdx.x, static_cast<unsigned>(TaskT), tasks, rCurrentTask.batchIdx,
-                   rCurrentTask.syncIdx, rCurrentTask.cData[gradIndex], pA.ptQ);
+                   rCurrentTask.syncIdx, pA.ptQ, ptQOffset, pA.ptQ + ptQOffset);
         }
 #endif
-        const auto offset = ACC::TNx::value * rCurrentTask.batchIdx;
-        auto* __restrict__ tQ = CAST_TO(uint, pA.ptQ + (rCurrentTask.syncIdx * ACC::TNx::value));
         const auto cIdx = threadIdx.x % eS;
         const auto sTQ = make_tensor(cute::make_smem_ptr(workspace),
             cute::Layout<cute::Shape<cute::Int<threads>, cute::Int<eS>>,
@@ -1040,11 +1042,15 @@ namespace flashmoe::processor{
         __syncthreads();
         if (!threadIdx.x) {
             __threadfence();
+#if FLASHMOE_DEBUG
+            const auto tQH_before = atomicAdd(pA.tQH + rCurrentTask.syncIdx, 0U);
+#endif
             atomicAdd(pA.tQH + rCurrentTask.syncIdx, tasks);
 #if FLASHMOE_DEBUG
             if (blockIdx.x < 2) {
-                printf("DEBUG notifyGradientImpl DONE: block=%u TaskT=%u added %u tasks to syncIdx=%u\n",
-                       blockIdx.x, static_cast<unsigned>(TaskT), tasks, rCurrentTask.syncIdx);
+                printf("DEBUG notifyGradientImpl DONE: block=%u TaskT=%u syncIdx=%u tQH_before=%u adding=%u tQH_after=%u\n",
+                       blockIdx.x, static_cast<unsigned>(TaskT), rCurrentTask.syncIdx,
+                       tQH_before, tasks, tQH_before + tasks);
             }
 #endif
         }
@@ -1334,12 +1340,17 @@ namespace flashmoe::processor{
 //                 }
 // #endif
 #if FLASHMOE_DEBUG
-                // Log gradient task types being processed
+                // Log gradient task types being processed and check for corruption
                 if (!threadIdx.x && blockIdx.x < 3) {
                     const auto taskTypeVal = static_cast<unsigned>(rCurrentTask.taskType);
-                    if (taskTypeVal >= 3) { // gradient tasks start at 3 (gradPreGEMM)
-                        printf("DEBUG processor TASK: block=%u type=%u tile=%u syncIdx=%u\n",
-                               blockIdx.x, taskTypeVal, rCurrentTask.tileIdx, rCurrentTask.syncIdx);
+                    if (taskTypeVal > 8) {
+                        printf("DEBUG processor CORRUPT_TASK: block=%u type=%u (INVALID>8!) syncIdx=%u tileIdx=%u batchIdx=%u aData=%p\n",
+                               blockIdx.x, taskTypeVal, rCurrentTask.syncIdx, rCurrentTask.tileIdx,
+                               rCurrentTask.batchIdx, rCurrentTask.aData);
+                    } else if (taskTypeVal >= 3) { // gradient tasks start at 3 (gradPreGEMM)
+                        printf("DEBUG processor TASK: block=%u type=%u tile=%u syncIdx=%u batchIdx=%u\n",
+                               blockIdx.x, taskTypeVal, rCurrentTask.tileIdx, rCurrentTask.syncIdx,
+                               rCurrentTask.batchIdx);
                     }
                 }
 #endif
@@ -1521,16 +1532,50 @@ namespace flashmoe::processor{
                         __syncthreads();
                         if (!threadIdx.x) {
                             __threadfence();
-                            enqueue = atomicAdd(pA.tQS + rCurrentTask.syncIdx, 1U) + 1 == tNx;
+                            const auto combineSyncIdx = rCurrentTask.syncIdx + bookkeeping.gtQCl;
+                            // P2P: 1 gradCombine + 1 gradGateCombine = 2 tasks per syncIdx
+                            // Remote: tNx gradCombine + tNx gradGateCombine = 2*tNx tasks per syncIdx
+                            const auto threshold = rCurrentTask.isPeerRemote ? 2 * tNx : 2;
+                            enqueue = atomicAdd(pA.tQS + combineSyncIdx, 1U) + 1 == threshold;
                         }
                         __syncthreads();
                         if (enqueue) {
+                            rCurrentTask.cData[0] = CAST_TO(cuda::std::byte, bookkeeping.gGateCombine());
+                            rCurrentTask.bData[0] = CONST_CAST_TO(cuda::std::byte, flashmoe::moe::hiddenStatesPtr);
+                            rCurrentTask.bData[1] = CONST_CAST_TO(cuda::std::byte, flashmoe::moe::gateWeightsPtr);
+                            rCurrentTask.dData[0] = CAST_TO(cuda::std::byte, flashmoe::moe::gradInputBasePtr);
+#if FLASHMOE_DEBUG
+                            if (!threadIdx.x && blockIdx.x < 2) {
+                                printf("DEBUG gradCombine ENQUEUE: block=%u syncIdx=%u combineSyncIdx=%u remote=%u CALLING notifyGradient...\n",
+                                       blockIdx.x, rCurrentTask.syncIdx, rCurrentTask.syncIdx + bookkeeping.gtQCl, rCurrentTask.isPeerRemote);
+                            }
+#endif
                             if (!rCurrentTask.isPeerRemote) {
                                 notifyGradient<PeerConnectivity::p2p>(CAST_TO(uint, workspace), rCurrentTask, pA);
+#if FLASHMOE_DEBUG
+                                if (!threadIdx.x && blockIdx.x < 2) {
+                                    printf("DEBUG gradCombine ENQUEUE: block=%u syncIdx=%u CALLING notifyGateGradient...\n",
+                                           blockIdx.x, rCurrentTask.syncIdx);
+                                }
+#endif
+                                notifyGateGradient<PeerConnectivity::p2p>(CAST_TO(uint, workspace), rCurrentTask, pA);
                             }
                             else {
                                 notifyGradient<PeerConnectivity::remote>(CAST_TO(uint, workspace), rCurrentTask, pA);
+#if FLASHMOE_DEBUG
+                                if (!threadIdx.x && blockIdx.x < 2) {
+                                    printf("DEBUG gradCombine ENQUEUE: block=%u syncIdx=%u CALLING notifyGateGradient...\n",
+                                           blockIdx.x, rCurrentTask.syncIdx);
+                                }
+#endif
+                                notifyGateGradient<PeerConnectivity::remote>(CAST_TO(uint, workspace), rCurrentTask, pA);
                             }
+#if FLASHMOE_DEBUG
+                            if (!threadIdx.x && blockIdx.x < 2) {
+                                printf("DEBUG gradCombine ENQUEUE: block=%u syncIdx=%u DONE both notifications\n",
+                                       blockIdx.x, rCurrentTask.syncIdx);
+                            }
+#endif
                         }
                     }
                     break;
@@ -1597,16 +1642,49 @@ namespace flashmoe::processor{
                             // Set dData[0] for gradGateGEMM to write input gradients
                             rCurrentTask.dData[0] = CAST_TO(cuda::std::byte, flashmoe::moe::gradInputBasePtr);
                             __threadfence();
-                            enqueue = atomicAdd(pA.tQS + rCurrentTask.syncIdx, 1U) + 1 == tNx;
+                            // FIX: Use offset syncIdx for tQS access to avoid collision with gradPostGEMM
+                            // gradPostGEMM uses tQS[0, gtQCl), combine tasks use tQS[gtQCl, 2*gtQCl)
+                            const auto combineSyncIdx = rCurrentTask.syncIdx + bookkeeping.gtQCl;
+                            // FIX: Threshold depends on peer connectivity
+                            // P2P: 1 gradCombine + 1 gradGateCombine = 2 tasks per syncIdx
+                            // Remote: tNx gradCombine + tNx gradGateCombine = 2*tNx tasks per syncIdx
+                            const auto threshold = rCurrentTask.isPeerRemote ? 2 * tNx : 2;
+                            enqueue = atomicAdd(pA.tQS + combineSyncIdx, 1U) + 1 == threshold;
                         }
                         __syncthreads();
                         if (enqueue) {
+#if FLASHMOE_DEBUG
+                            if (!threadIdx.x && blockIdx.x < 2) {
+                                printf("DEBUG gradGateCombine ENQUEUE: block=%u syncIdx=%u combineSyncIdx=%u remote=%u CALLING notifyGradient...\n",
+                                       blockIdx.x, rCurrentTask.syncIdx, rCurrentTask.syncIdx + bookkeeping.gtQCl, rCurrentTask.isPeerRemote);
+                            }
+#endif
                             if (!rCurrentTask.isPeerRemote) {
+                                notifyGradient<PeerConnectivity::p2p>(CAST_TO(uint, workspace), rCurrentTask, pA);
+#if FLASHMOE_DEBUG
+                                if (!threadIdx.x && blockIdx.x < 2) {
+                                    printf("DEBUG gradGateCombine ENQUEUE: block=%u syncIdx=%u CALLING notifyGateGradient...\n",
+                                           blockIdx.x, rCurrentTask.syncIdx);
+                                }
+#endif
                                 notifyGateGradient<PeerConnectivity::p2p>(CAST_TO(uint, workspace), rCurrentTask, pA);
                             }
                             else {
+                                notifyGradient<PeerConnectivity::remote>(CAST_TO(uint, workspace), rCurrentTask, pA);
+#if FLASHMOE_DEBUG
+                                if (!threadIdx.x && blockIdx.x < 2) {
+                                    printf("DEBUG gradGateCombine ENQUEUE: block=%u syncIdx=%u CALLING notifyGateGradient...\n",
+                                           blockIdx.x, rCurrentTask.syncIdx);
+                                }
+#endif
                                 notifyGateGradient<PeerConnectivity::remote>(CAST_TO(uint, workspace), rCurrentTask, pA);
                             }
+#if FLASHMOE_DEBUG
+                            if (!threadIdx.x && blockIdx.x < 2) {
+                                printf("DEBUG gradGateCombine ENQUEUE: block=%u syncIdx=%u DONE both notifications\n",
+                                       blockIdx.x, rCurrentTask.syncIdx);
+                            }
+#endif
                         }
                     }
                     break;

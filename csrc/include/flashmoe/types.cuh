@@ -818,7 +818,8 @@ namespace flashmoe{
                         cute::ceil_div(TCM * TN, WARP_SIZE) +
                         cute::ceil_div(TCM * E, SUBSCRIBERS) * ACC::TNx::value;
                 sT = tPS * SUBSCRIBERS;
-                ilt = 1 + 1 + nLx + blocks + 2 * (gtQCl + E) + E * TCM * TNx;
+                // 3*gtQCl = tQH (gtQCl) + extended tSA (2*gtQCl) for combine task sync counters
+                ilt = 1 + 1 + nLx + blocks + 3 * gtQCl + 2 * E + E * TCM * TNx;
             }
         }
 
@@ -977,7 +978,7 @@ namespace flashmoe{
         }
         __device__ __forceinline__
         auto* sQ() const {
-            return tSA() + gtQCl;
+            return tSA() + 2 * gtQCl;
         }
         /// expert counts
         __device__ __forceinline__
@@ -992,7 +993,8 @@ namespace flashmoe{
             sizeof(BookType) == sizeof(mp_t));
         __host__ __device__ __forceinline__
         unsigned long queueSpanEntries() const {
-            return 2UL * gtQCl +
+            // 3*gtQCl = gtQCl (tQH) + 2*gtQCl (extended tSA for combine task sync counters)
+            return 3UL * gtQCl +
                 ACC::PeakHardware::OS::processorBlocks::value +
                 2UL * ACC::E::value;
         }
@@ -1071,7 +1073,8 @@ namespace flashmoe{
             const auto gtQCl = _world * _nLx * ACC::TCM::value;
             constexpr auto flt = 2 * ACC::E::value + 1;
             static_assert(sizeof(LXI) == sizeof(BookType) && alignof(LXI) == alignof(BookType));
-            const auto ilt = 1 + 1 + _nLx + blocks + 2 * (gtQCl + ACC::E::value) +
+            // 3*gtQCl = tQH (gtQCl) + extended tSA (2*gtQCl) for combine task sync counters
+            const auto ilt = 1 + 1 + _nLx + blocks + 3 * gtQCl + 2 * ACC::E::value +
                 ACC::E::value * ACC::TCM::value * ACC::TNx::value;
             static_assert(sizeof(mp_t) == sizeof(BookType) && alignof(mp_t) == alignof(BookType));
             return flt + ilt;
