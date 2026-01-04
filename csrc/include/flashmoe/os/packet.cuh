@@ -602,7 +602,7 @@ namespace flashmoe::packet {
             const auto xMOffset = (peerIdx * dA.nLx + localExpertIdx) * pEC * P * sizeof(Element);
             auto* xMLocation = pGB + xMOffset;
 
-            const auto sO = TCM * (peerIdx * dA.nLx + localExpertIdx);
+            const auto sO = TCM * (peerIdx * dA.nLx + localExpertIdx) + batchIdx;
             const auto syncIdx = sO + (tileIdx / TN);
 
             const auto padM = Bookkeeping::pad<BLOCK_M>(nTokens);
@@ -754,7 +754,7 @@ namespace flashmoe::packet {
 
             const auto xMOffset = (peerIdx * dA.nLx + localExpertIdx) * pEC * P * sizeof(Element);
             auto* xMLocation = pGB + xMOffset;
-            const auto sO = TCM * (peerIdx * dA.nLx + localExpertIdx);
+            const auto sO = TCM * (peerIdx * dA.nLx + localExpertIdx) + batchIdx;
             const auto padM = Bookkeeping::pad<BLOCK_M>(nTokens);
 
             auto* rcData = heap::advance<1, 1>(dA.sHeap, dA.epRank, localExpertIdx);
