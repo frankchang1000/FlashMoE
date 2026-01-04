@@ -105,6 +105,11 @@ namespace flashmoe::moe{
         }
         for (uint i = idx; i < gtQCl; i += blocks * threads) {
             tQH[i] = tQHeadGroundState;
+        }
+        // Clear full combine counter region:
+        // tSA[0, gtQCl) for gradPostGEMM sync
+        // tSA[gtQCl, 2*gtQCl) for gradCombine + gradGateCombine sync
+        for (uint i = idx; i < 2 * gtQCl; i += blocks * threads) {
             tSA[i] = 0U;
         }
         for (uint i = idx; i < ACC::E::value; i += blocks * threads) {
