@@ -61,7 +61,8 @@ namespace flashmoe::subscriber{
             typename BiasUp,
             typename BiasDown,
             typename Element = ACC::Element,
-            unsigned int sNW = subscriberCount / WARP_SIZE
+            unsigned int sNW = subscriberCount / WARP_SIZE,
+            unsigned int pEC = ACC::pEC::value
         >
         __device__ __forceinline__
         void operator()(
@@ -75,6 +76,7 @@ namespace flashmoe::subscriber{
             /// Lookup Table
             const PLI* __restrict__ const& pL,
             const LXI* __restrict__ const& lX,
+            const cuda::std::byte* __restrict__ const& tPBase, /*TPS base pointer for gradient combine*/
             /// State
             BitSet* __restrict__ const& bitSet,
             uint* __restrict__ const& status,
@@ -170,6 +172,9 @@ namespace flashmoe::subscriber{
                         CONST_CAST_TO(cuda::std::byte, &biasDown(myLocalExIdx))
                     };
                     const auto* packet = heap::advance<0, 1>(dA.sHeap, peerIdx, myLocalExIdx);
+                    // Compute TPS pointer for this expert (used by gradient decoder)
+                    const auto* tokenIndices = tPBase + lXI.expertIndex * pEC * sizeof(TPS);
+
                     if (!pLI.isRemote) {
                         if (!laneId) {
                             // self-correct the termination bound
@@ -182,7 +187,7 @@ namespace flashmoe::subscriber{
                         if (isGradientPacket) {
                             gPd(dA, pLI.remoteSHeap, nFlags, packet, sP->routedTokens,
                                 myLocalExIdx, pGB, weights, savedActivations, peerIdx, pLI.pe,
-                                laneId, ltQHead, tQHead);
+                                laneId, ltQHead, tQHead, tokenIndices, lXI.expertIndex);
                         }
                         else {
                             fPd(dA, pLI.remoteSHeap, nFlags, packet, sP->routedTokens,
@@ -200,7 +205,8 @@ namespace flashmoe::subscriber{
                                 lXI.expertIndex * (ACC::TCM::value * ACC::TNx::value);
                         if (isGradientPacket) {
                             gRd(dA, dA.sHeap, nFlags, packet, sP->routedTokens,
-                                myLocalExIdx, pGB, weights, savedActivations, peerIdx, pLI.pe, laneId, ltQHead, tQHead);
+                                myLocalExIdx, pGB, weights, savedActivations, peerIdx, pLI.pe,
+                                laneId, ltQHead, tQHead, tokenIndices, lXI.expertIndex);
                         }
                         else {
                             fRd(dA, dA.sHeap, nFlags, packet, sP->routedTokens,
@@ -557,6 +563,7 @@ namespace flashmoe::subscriber{
                     pGB,
                     pL,
                     lX,
+                    CONST_CAST_TO(cuda::std::byte, bookkeeping.tP()), // TPS base for gradient combine
                     bitSet + pSI,
                     status,
                     taskCount,

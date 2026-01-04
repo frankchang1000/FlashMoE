@@ -515,6 +515,180 @@ namespace flashmoe::packet {
         }
     };
 
+    // Specialized initial gradient decoder that emits gradCombine/gradGateCombine
+    // instead of gradPostGEMM, aligning with the expected flow:
+    // gradCombine + gradGateCombine -> notifyGradient -> gradPostGEMM
+    template<PeerConnectivity p, typename Element>
+    struct Decoder<PacketStage::initial, p, Element, JobMode::gradient> {
+        static_assert(flashmoe::TensorValueType<Element>);
+        __device__ __forceinline__
+        void operator()(const DecoderArg& dA,
+            cuda::std::byte* const& sHeap,
+            flagsType* const& flags,
+            const cuda::std::byte* const& packet,
+            uint const& routedTokens,
+            unsigned int const& localExpertIdx,
+            cuda::std::byte* __restrict__ const& pGB, //postGEMM buffer (xM)
+            const cuda::std::array<const cuda::std::byte*, GEMMs>& weights,
+            const cuda::std::array<const cuda::std::byte*, GEMMs>& savedActivations,
+            unsigned int const& peer, // relative to the EP group
+            unsigned int const& gPeer, // relative to the global group
+            const uint& laneId,
+            unsigned int& lTQHead,
+            unsigned int* __restrict__ const& tQHead,
+            // Additional parameters for gradient combine path
+            const cuda::std::byte* const& tokenIndices, // TPS for this expert
+            const unsigned int& expertIdx) const { // global expert index
+
+            constexpr auto tNx = ACC::TNx::value;
+            constexpr auto TCM = ACC::TCM::value;
+            constexpr auto P = ACC::P::value;
+            constexpr auto pEC = ACC::pEC::value;
+            const auto qIdx = DQ::sNext(lTQHead);
+            const auto fTilesM = routedTokens / BLOCK_M;
+            const auto padM = Bookkeeping::pad<BLOCK_M>(routedTokens);
+
+            // xM location for this peer/expert
+            const auto xMOffset = (peer * dA.nLx + localExpertIdx) * pEC * P * sizeof(Element);
+            auto* xMLocation = pGB + xMOffset;
+
+            // rcData for signaling
+            auto* rcData = heap::advance<1, 1>(sHeap, dA.epRank, localExpertIdx);
+
+            // Task distribution across warp
+            const auto wT = fTilesM * tNx;
+            const auto fS = wT / WARP_SIZE + (laneId < wT % WARP_SIZE);
+            constexpr auto rT = tNx % WARP_SIZE;
+            const auto lS = tNx / WARP_SIZE + (rT > 0 ? laneId < rT : 0);
+            const auto tSlice = fS + (routedTokens % BLOCK_M == 0 ? 0 : lS);
+
+            // Compute residue once for use in both gradCombine and gradGateCombine
+            const auto residue = routedTokens - fTilesM * BLOCK_M;
+
+            // Track which batches this lane emits gate tasks for (max ~TCM batches typically small)
+            unsigned int myGateCount = 0;
+            // Store batch indices for gate tasks (small array, TCM is typically 2-4)
+            unsigned int gateBatches[8];  // Should be enough for typical TCM values
+
+#if FLASHMOE_DEBUG
+            if (laneId == 0 && localExpertIdx == 0 && routedTokens > 0) {
+                printf("DEBUG INITIAL_GRAD_DECODER: rank=%d peer=%u expert=%u(global) routedTokens=%u fTilesM=%u\n",
+                       nvshmem_my_pe(), peer, expertIdx, routedTokens, fTilesM);
+            }
+#endif
+            // Full tiles - emit gradCombine and track gate tasks
+            for (uint i = 0; i < fS; ++i) {
+                const auto tileIdx = laneId + i * WARP_SIZE;
+                const auto batchIdx = tileIdx / tNx;
+                const auto tileWithinBatch = tileIdx % tNx;
+
+                // syncIdx consistent with final decoder
+                const auto sO = TCM * (peer * dA.nLx + localExpertIdx) + batchIdx;
+                const auto syncIdx = sO;
+
+                // Emit gradCombine
+                Task gradTask{
+                    TaskType::gradCombine,
+                    tokenIndices,
+                    cuda::std::array<const cuda::std::byte*, GEMMs>{packet},
+                    BLOCK_M,  // tileSize for full tiles
+                    tileWithinBatch,
+                    expertIdx
+                };
+                gradTask.cData[0] = xMLocation;
+                gradTask.cData[1] = const_cast<cuda::std::byte*>(packet);
+                gradTask.syncIdx = syncIdx;
+                gradTask.M = padM;
+                gradTask.peerIdx = peer;
+                gradTask.batchIdx = batchIdx;
+                gradTask.isPeerRemote = (p == PeerConnectivity::remote);
+                gradTask.bData = weights;
+                gradTask.dData = savedActivations;
+                gradTask.rcData = rcData;
+                gradTask.flags = flags;
+                dA.tQ[DQ::next(qIdx, i)] = gradTask;
+
+                // Record gate task for this batch (at first tile of batch)
+                if (tileWithinBatch == 0 && myGateCount < 8) {
+                    gateBatches[myGateCount++] = batchIdx;
+                }
+            }
+
+            // Residue tile
+            if (residue) {
+                for (uint j = 0; j < lS; j++) {
+                    const auto tileIdx = fTilesM * tNx + laneId + j * WARP_SIZE;
+                    const auto batchIdx = fTilesM; // residue batch
+                    const auto tileWithinBatch = tileIdx - fTilesM * tNx;
+
+                    const auto sO = TCM * (peer * dA.nLx + localExpertIdx) + batchIdx;
+                    const auto syncIdx = sO;
+
+                    Task gradTask{
+                        TaskType::gradCombine,
+                        tokenIndices,
+                        cuda::std::array<const cuda::std::byte*, GEMMs>{packet},
+                        residue,  // tileSize for residue tile
+                        tileWithinBatch,
+                        expertIdx
+                    };
+                    gradTask.cData[0] = xMLocation;
+                    gradTask.cData[1] = const_cast<cuda::std::byte*>(packet);
+                    gradTask.syncIdx = syncIdx;
+                    gradTask.M = padM;
+                    gradTask.peerIdx = peer;
+                    gradTask.batchIdx = batchIdx;
+                    gradTask.isPeerRemote = (p == PeerConnectivity::remote);
+                    gradTask.bData = weights;
+                    gradTask.dData = savedActivations;
+                    gradTask.rcData = rcData;
+                    gradTask.flags = flags;
+                    dA.tQ[DQ::next(qIdx, fS + j)] = gradTask;
+
+                    // Record gate task for residue batch (at first tile)
+                    if (tileWithinBatch == 0 && myGateCount < 8) {
+                        gateBatches[myGateCount++] = batchIdx;
+                    }
+                }
+            }
+
+            // Per-subscriber queue accounting: each subscriber advances its own queue
+            // by the tasks it actually emitted, placing gate tasks after local combine tasks
+            const auto totalTasks = tSlice + myGateCount;
+            if (totalTasks) {
+                // Emit gate tasks after this subscriber's combine tasks
+                for (uint g = 0; g < myGateCount; ++g) {
+                    const auto batch = gateBatches[g];
+                    const auto sO = TCM * (peer * dA.nLx + localExpertIdx) + batch;
+                    // Gate tileSize: BLOCK_M for full batches, residue for residue batch
+                    const auto gateTileSize = (batch < fTilesM) ? BLOCK_M : residue;
+
+                    Task gateTask{
+                        TaskType::gradGateCombine,
+                        tokenIndices,
+                        cuda::std::array<const cuda::std::byte*, GEMMs>{packet},
+                        gateTileSize,
+                        0U, // tileIdx for gate task
+                        expertIdx
+                    };
+                    gateTask.cData[0] = const_cast<cuda::std::byte*>(packet);
+                    gateTask.syncIdx = sO;
+                    gateTask.M = padM;
+                    gateTask.peerIdx = peer;
+                    gateTask.batchIdx = batch;
+                    gateTask.isPeerRemote = (p == PeerConnectivity::remote);
+
+                    const auto gateSlot = tSlice + g; // local offset after combine tasks
+                    dA.tQ[DQ::next(qIdx, gateSlot)] = gateTask;
+                }
+
+                lTQHead += totalTasks;
+                __threadfence();
+                atomicAdd_block(tQHead, totalTasks);
+            }
+        }
+    };
+
     template<typename Element, JobMode m>
     struct Decoder<PacketStage::last, PeerConnectivity::p2p, Element, m> {
         __device__ __forceinline__
@@ -564,7 +738,11 @@ namespace flashmoe::packet {
         }
     };
 
-    // specialized gradient decoder
+    // Specialized P2P gradient decoder for gradPreGEMM completion signals.
+    // Only emits gradInputCombine - gradCombine/gradGateCombine are now
+    // handled by the initial gradient decoder to align with the expected flow:
+    // initial decoder → gradCombine + gradGateCombine → notifyGradient → gradPostGEMM → gradPreGEMM
+    // final decoder (this) ← gradPreGEMM completion → gradInputCombine
     template<typename Element>
     struct Decoder<PacketStage::last, PeerConnectivity::p2p, Element, JobMode::gradient> {
         __device__ __forceinline__
@@ -607,53 +785,9 @@ namespace flashmoe::packet {
 
             const auto padM = Bookkeeping::pad<BLOCK_M>(nTokens);
 
-            auto* rcData = heap::advance<1, 1>(dA.sHeap, dA.epRank, localExpertIdx);
-
-            Task gradTask{
-                TaskType::gradCombine,
-                tokenIndices,
-                cuda::std::array<const cuda::std::byte*, GEMMs>{packet},
-                nTokens,
-                tileIdx,
-                expertIdx
-            };
-            gradTask.cData[0] = xMLocation;
-            gradTask.cData[1] = const_cast<cuda::std::byte*>(packet);
-            gradTask.syncIdx = syncIdx;
-            gradTask.M = padM;
-            gradTask.peerIdx = peerIdx;
-            gradTask.batchIdx = batchIdx;
-            gradTask.isPeerRemote = false;
-            gradTask.bData = weights;
-            gradTask.dData = savedActivations;  // Base pointers (unused by processor)
-            gradTask.rcData = rcData;
-            gradTask.flags = flags;
-// #if FLASHMOE_DEBUG
-//             printf("DEBUG gLPd DECODE: expert=%u localExpert=%u peer=%u syncIdx=%u tileIdx=%u flags=%p batchIdx=%u\n",
-//                    expertIdx, localExpertIdx, peerIdx, syncIdx, tileIdx, flags, batchIdx);
-// #endif
-            emitTask(gradTask);
-
-            Task gateTask{
-                TaskType::gradGateCombine,
-                tokenIndices,
-                cuda::std::array<const cuda::std::byte*, GEMMs>{packet},
-                nTokens,
-                tileIdx,
-                expertIdx
-            };
-            gateTask.cData[0] = const_cast<cuda::std::byte*>(packet);
-            gateTask.syncIdx = syncIdx;
-            gateTask.M = padM;
-            gateTask.peerIdx = peerIdx;
-            gateTask.batchIdx = batchIdx;
-            gateTask.isPeerRemote = false;
-            emitTask(gateTask);
-
-            // For remote experts (gradPreGEMM completion signals), create gradInputCombine
-            // Local experts have peerIdx == epRank (initial backward signal)
-            // Remote experts have peerIdx != epRank (gradPreGEMM completion signal)
-            if (peerIdx != dA.epRank) {
+            // Emit only gradInputCombine for gradPreGEMM completion signals
+            // gradCombine and gradGateCombine are now handled by the initial decoder
+            {
                 Task inputTask{
                     TaskType::gradInputCombine,
                     tokenIndices,                    // aData: TPS array
@@ -725,7 +859,11 @@ namespace flashmoe::packet {
         }
     };
 
-    // specialized gradient decoder for remote
+    // Specialized remote gradient decoder for gradPreGEMM completion signals.
+    // Only emits gradInputCombine - gradCombine/gradGateCombine are now
+    // handled by the initial gradient decoder to align with the expected flow:
+    // initial decoder → gradCombine + gradGateCombine → notifyGradient → gradPostGEMM → gradPreGEMM
+    // final decoder (this) ← gradPreGEMM completion → gradInputCombine
     template<typename Element>
     struct Decoder<PacketStage::last, PeerConnectivity::remote, Element, JobMode::gradient> {
         __device__ __forceinline__
@@ -757,80 +895,30 @@ namespace flashmoe::packet {
             const auto sO = TCM * (peerIdx * dA.nLx + localExpertIdx) + batchIdx;
             const auto padM = Bookkeeping::pad<BLOCK_M>(nTokens);
 
-            auto* rcData = heap::advance<1, 1>(dA.sHeap, dA.epRank, localExpertIdx);
-
+            // Emit only gradInputCombine for gradPreGEMM completion signals (tNx tasks)
+            // gradCombine and gradGateCombine are now handled by the initial decoder
             for (uint i = 0; i < tNx; ++i) {
-                const auto syncIdx = sO + (i / TN);
-                Task gradTask{
-                    TaskType::gradCombine,
+                const auto inputSyncIdx = sO + (i / TN);
+                Task inputTask{
+                    TaskType::gradInputCombine,
                     tokenIndices,
-                    cuda::std::array<const cuda::std::byte*, GEMMs>{packet},
+                    cuda::std::array<const cuda::std::byte*, GEMMs>{},
                     nTokens,
                     i,
                     expertIdx
                 };
-                gradTask.cData[0] = xMLocation;
-                gradTask.cData[1] = const_cast<cuda::std::byte*>(packet);
-                gradTask.syncIdx = syncIdx;
-                gradTask.M = padM;
-                gradTask.peerIdx = peerIdx;
-                gradTask.batchIdx = batchIdx;
-                gradTask.isPeerRemote = true;
-                gradTask.bData = weights;
-                gradTask.dData = savedActivations;
-                gradTask.rcData = rcData;
-                gradTask.flags = flags;
-                dA.tQ[DQ::next(qIdx, i)] = gradTask;
+                inputTask.cData[0] = xMLocation;
+                inputTask.cData[1] = const_cast<cuda::std::byte*>(packet);  // heap location
+                inputTask.syncIdx = inputSyncIdx;
+                inputTask.M = padM;
+                inputTask.peerIdx = peerIdx;
+                inputTask.batchIdx = batchIdx;
+                inputTask.isPeerRemote = true;
+                dA.tQ[DQ::next(qIdx, i)] = inputTask;
             }
 
-            for (uint i = 0; i < tNx; ++i) {
-                const auto gateIdx = DQ::next(qIdx, tNx + i);
-                const auto gateSyncIdx = sO + (i / TN);
-                Task gateTask{
-                    TaskType::gradGateCombine,
-                    tokenIndices,
-                    cuda::std::array<const cuda::std::byte*, GEMMs>{packet},
-                    nTokens,
-                    i,
-                    expertIdx
-                };
-                gateTask.cData[0] = const_cast<cuda::std::byte*>(packet);
-                gateTask.syncIdx = gateSyncIdx;
-                gateTask.M = padM;
-                gateTask.peerIdx = peerIdx;
-                gateTask.batchIdx = batchIdx;
-                gateTask.isPeerRemote = true;
-                dA.tQ[gateIdx] = gateTask;
-            }
-
-            // For remote experts (gradPreGEMM completion signals), create gradInputCombine
-            // Local experts have peerIdx == epRank (initial backward signal)
-            // Remote experts have peerIdx != epRank (gradPreGEMM completion signal)
-            const bool isRemoteExpert = (peerIdx != dA.epRank);
-            if (isRemoteExpert) {
-                for (uint i = 0; i < tNx; ++i) {
-                    const auto inputIdx = DQ::next(qIdx, 2 * tNx + i);
-                    const auto inputSyncIdx = sO + (i / TN);
-                    Task inputTask{
-                        TaskType::gradInputCombine,
-                        tokenIndices,
-                        cuda::std::array<const cuda::std::byte*, GEMMs>{},
-                        nTokens,
-                        i,
-                        expertIdx
-                    };
-                    inputTask.cData[0] = xMLocation;
-                    inputTask.cData[1] = const_cast<cuda::std::byte*>(packet);  // heap location
-                    inputTask.syncIdx = inputSyncIdx;
-                    inputTask.M = padM;
-                    inputTask.peerIdx = peerIdx;
-                    inputTask.batchIdx = batchIdx;
-                    inputTask.isPeerRemote = true;
-                    dA.tQ[inputIdx] = inputTask;
-                }
-            }
-
-            const auto totalTasks = isRemoteExpert ? tNx * 3U : tNx * 2U;
+            // Only tNx gradInputCombine tasks
+            constexpr auto totalTasks = tNx;
             lTQHead += totalTasks;
             __threadfence();
             atomicAdd_block(tQHead, totalTasks);

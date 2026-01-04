@@ -1637,12 +1637,6 @@ namespace flashmoe::processor{
                         }
                         __syncthreads();
                         if (!threadIdx.x) {
-                            // Pass global gateBuffer base to gradGateGEMM (not tile-offset)
-                            rCurrentTask.cData[gradIndex] = CAST_TO(cuda::std::byte, gateBuffer);
-                            rCurrentTask.bData[0] = CONST_CAST_TO(cuda::std::byte, flashmoe::moe::hiddenStatesPtr);
-                            rCurrentTask.bData[1] = CONST_CAST_TO(cuda::std::byte, flashmoe::moe::gateWeightsPtr);
-                            // Set dData[0] for gradGateGEMM to write input gradients
-                            rCurrentTask.dData[0] = CAST_TO(cuda::std::byte, flashmoe::moe::gradInputBasePtr);
                             __threadfence();
                             // FIX: Use offset syncIdx for tQS access to avoid collision with gradPostGEMM
                             // gradPostGEMM uses tQS[0, gtQCl), combine tasks use tQS[gtQCl, 2*gtQCl)
@@ -1660,6 +1654,10 @@ namespace flashmoe::processor{
                         }
                         __syncthreads();
                         if (enqueue) {
+                            rCurrentTask.cData[gradIndex] = CAST_TO(cuda::std::byte, gateBuffer);
+                            rCurrentTask.bData[0] = CONST_CAST_TO(cuda::std::byte, flashmoe::moe::hiddenStatesPtr);
+                            rCurrentTask.bData[1] = CONST_CAST_TO(cuda::std::byte, flashmoe::moe::gateWeightsPtr);
+                            rCurrentTask.dData[0] = CAST_TO(cuda::std::byte, flashmoe::moe::gradInputBasePtr);
 #if FLASHMOE_DEBUG
                             if (!threadIdx.x && blockIdx.x < 2) {
                                 printf("DEBUG gradGateCombine ENQUEUE: block=%u syncIdx=%u combineSyncIdx=%u remote=%u CALLING notifyGradient...\n",
