@@ -770,6 +770,207 @@ namespace flashmoe::processor{
             }
         }
     }
+    template<
+        typename BlockGEMM,
+        unsigned int N,
+        unsigned int K,
+        unsigned int elems = ACC::Elems::value,
+        unsigned int threads = ACC::PeakHardware::OS::threads::value
+    >
+    __forceinline__ __device__
+    void fGETGrad(typename BlockGEMM::MatrixDType* __restrict__ const& workspace,
+        const typename BlockGEMM::MatrixAType* __restrict__ const& inputs,
+        const typename BlockGEMM::MatrixBType* __restrict__ const& weights,
+        typename BlockGEMM::MatrixDType* __restrict__ const& output,
+        const typename BlockGEMM::MatrixDType* __restrict__ const& savedActivation,
+        const unsigned int& M,
+        const unsigned int& tileIdx) {
+        using Element = typename BlockGEMM::MatrixDType;
+        using MMA = typename BlockGEMM::MMA;
+        using ElementC = ACC::ElementC;
+
+        constexpr auto bM = cute::get<0>(typename BlockGEMM::BlockTiler{});
+        constexpr auto bN = cute::get<1>(typename BlockGEMM::BlockTiler{});
+        constexpr auto bK = cute::get<2>(typename BlockGEMM::BlockTiler{});
+
+        constexpr auto gCStoreOp = cutlass::NumericConverter<Element, ElementC>{};
+        constexpr auto gDLoadOp = cutlass::NumericConverter<ElementC, Element>{};
+        typename BlockGEMM::FusedEpilogue epilogueOp{};
+
+        // Row-major input [M, K]
+        const auto mA = make_tensor(cute::make_gmem_ptr(inputs),
+            make_layout(cute::make_shape(M, K), cute::Stride<cute::Int<K>, cute::_1>{}));
+        // Saved activation [M, K] - same shape as input
+        const auto mSavedAct = make_tensor(cute::make_gmem_ptr(savedActivation),
+            make_layout(cute::make_shape(M, K), cute::Stride<cute::Int<K>, cute::_1>{}));
+        // Interpret weights as [K, N] row-major for A @ B semantics
+        // Physical storage for this op is [K, N] row-major, so mB(k, n) = weights[k*N + n]
+        // This allows us to transpose during load: sB(n, k) = mB(k, n)
+        const auto mB = make_tensor(cute::make_gmem_ptr(weights),
+            cute::Layout<cute::Shape<cute::Int<K>, cute::Int<N>>,
+                cute::Stride<cute::Int<N>, cute::_1>>{});
+        // Row-major output [M, N]
+        const auto mC = make_tensor(cute::make_gmem_ptr(output),
+            make_layout(cute::make_shape(M, N), cute::Stride<cute::Int<N>, cute::_1>{}));
+
+        const auto tilesM = M / bM;
+        constexpr auto tilesN = N / bN;
+        constexpr auto tilesK = K / bK;
+
+        const auto tileCoord = idx2crd(tileIdx, cute::Shape(tilesM, tilesN),
+            cute::Stride<cute::Int<tilesN>, cute::_1>{});
+        const auto ctaCoord = make_coord(cute::get<0>(tileCoord), cute::get<1>(tileCoord), cute::_);
+
+        const auto gC = cute::local_tile(mC, typename BlockGEMM::BlockTiler{}, ctaCoord,
+            cute::Step<cute::_1, cute::_1, cute::X>{});
+
+        // Shared memory layout for A and B tiles - use same layouts as BlockGEMM
+        using sLayAAtom = typename BlockGEMM::Parameters::sLayA;
+        using sLayBAtom = typename BlockGEMM::Parameters::sLayB;
+        using sLayA = decltype(cute::tile_to_shape(sLayAAtom{}, cute::Shape<cute::Int<bM>, cute::Int<bK>>{}));
+        using sLayB = decltype(cute::tile_to_shape(sLayBAtom{}, cute::Shape<cute::Int<bN>, cute::Int<bK>>{}));
+
+        constexpr auto smemAElements = cute::size(sLayA{});
+        constexpr auto smemBElements = cute::size(sLayB{});
+        static_assert(ACC::sharedSize::value >= sizeof(Element) * (smemAElements + smemBElements));
+
+        auto* __restrict__ sARaw = CAST_TO(Element, workspace);
+        auto* __restrict__ sBRaw = sARaw + smemAElements;
+
+        const auto sA = cute::make_tensor(cute::make_smem_ptr(sARaw), sLayA{});
+        const auto sB = cute::make_tensor(cute::make_smem_ptr(sBRaw), sLayB{});
+
+        MMA tiledMMA{};
+        auto thr_mma = tiledMMA.get_slice(threadIdx.x);
+
+        auto tCsA = thr_mma.partition_A(sA);  // (MMA, MMA_M, MMA_K)
+        auto tCsB = thr_mma.partition_B(sB);  // (MMA, MMA_N, MMA_K)
+
+        auto tCrA = thr_mma.make_fragment_A(tCsA);  // (MMA, MMA_M, MMA_K)
+        auto tCrB = thr_mma.make_fragment_B(tCsB);  // (MMA, MMA_N, MMA_K)
+
+        using sCLayC = cute::Layout<cute::Shape<cute::Int<bM>, cute::Int<bN>>,
+            cute::Stride<cute::Int<bN>, cute::_1>>;
+        const auto sC_for_partition = cute::make_tensor(cute::make_smem_ptr(CAST_TO(ElementC, workspace)), sCLayC{});
+        auto accumulator = thr_mma.partition_fragment_C(sC_for_partition);  // (MMA, MMA_M, MMA_N)
+        cute::clear(accumulator);
+        static_assert(cute::size(accumulator) % elems == 0);
+
+        // K-tile loop: load tiles to smem, apply act' to A, then gemm via tensor cores
+        for (uint kTile = 0; kTile < tilesK; ++kTile) {
+            const auto mTileRow = cute::get<0>(tileCoord) * bM;
+            const auto nTileCol = cute::get<1>(tileCoord) * bN;
+
+            constexpr auto elementsPerThreadA = (bM * bK + threads - 1) / threads;
+            #pragma unroll
+            for (uint e = 0; e < elementsPerThreadA; ++e) {
+                const auto flatIdx = threadIdx.x + e * threads;
+                if (flatIdx < bM * bK) {
+                    const auto localRow = flatIdx / bK;
+                    const auto localCol = flatIdx % bK;
+                    const auto globalRow = mTileRow + localRow;
+                    const auto globalCol = kTile * bK + localCol;
+
+                    if (globalRow < M && globalCol < K) {
+                        const auto inVal = gDLoadOp(mA(globalRow, globalCol));
+                        const auto savedVal = gDLoadOp(mSavedAct(globalRow, globalCol));
+                        // grad_z = grad * act'(z) - apply activation derivative before GEMM
+                        sA(localRow, localCol) = gCStoreOp(epilogueOp(inVal, savedVal));
+                    } else {
+                        sA(localRow, localCol) = Element(0);
+                    }
+                }
+            }
+
+            // Load B tile (weights) with transpose: sB(n,k) = mB(k,n)
+            // sLayB matches BlockGEMM layout, so index sB(n,k) directly
+            // mB is [K, N] row-major, so mB(k,n) reads from weights[k*N + n]
+            // This achieves A @ B semantics (MMA computes A @ sB^T = A @ B)
+            constexpr auto elementsPerThreadB = (bN * bK + threads - 1) / threads;
+            #pragma unroll
+            for (uint e = 0; e < elementsPerThreadB; ++e) {
+                const auto flatIdx = threadIdx.x + e * threads;
+                if (flatIdx < bN * bK) {
+                    // [bN, bK] row-major indexing for sB
+                    const auto localN = flatIdx / bK;
+                    const auto localK = flatIdx % bK;
+                    const auto globalN = nTileCol + localN;
+                    const auto globalK = kTile * bK + localK;
+
+                    if (globalK < K && globalN < N) {
+                        // Transpose: sB(n,k) = mB(k,n) = weights[k*N + n]
+                        sB(localN, localK) = mB(globalK, globalN);
+                    } else {
+                        sB(localN, localK) = Element(0);
+                    }
+                }
+            }
+            __syncthreads();
+
+            constexpr int K_BLOCK_MAX = cute::size<2>(tCrA);
+            #pragma unroll
+            for (int k_block = 0; k_block < K_BLOCK_MAX; ++k_block) {
+                #pragma unroll
+                for (int m = 0; m < cute::size<1>(tCrA); ++m) {
+                    #pragma unroll
+                    for (int i = 0; i < cute::size<0>(tCrA); ++i) {
+                        tCrA(i, m, k_block) = tCsA(i, m, k_block);
+                    }
+                }
+                #pragma unroll
+                for (int n = 0; n < cute::size<1>(tCrB); ++n) {
+                    #pragma unroll
+                    for (int i = 0; i < cute::size<0>(tCrB); ++i) {
+                        tCrB(i, n, k_block) = tCsB(i, n, k_block);
+                    }
+                }
+                cute::gemm(thr_mma, tCrA(cute::_, cute::_, k_block), tCrB(cute::_, cute::_, k_block), accumulator);
+            }
+            __syncthreads();
+        }
+
+        constexpr auto sCLay = cute::make_layout(cute::Shape<cute::Int<bM>, cute::Int<elems>>{},
+            cute::LayoutRight{});
+        const auto sC = cute::make_tensor(cute::make_smem_ptr(CAST_TO(ElementC, workspace)), sCLay);
+        const auto rC = cute::make_tensor(cute::make_rmem_ptr(CAST_TO(Element, accumulator.data())),
+            cute::Layout<cute::Shape<cute::_1, cute::Int<bN>>,
+                cute::Stride<cute::Int<bN>, cute::_1>>{});
+        const auto tCsC = thr_mma.partition_C(sC);
+
+        constexpr auto trips = cute::size(accumulator) / elems;
+
+        #pragma unroll
+        for (unsigned int i = 0; i < trips; ++i) {
+            #pragma unroll
+            for (unsigned int j = 0; j < elems; ++j) {
+                tCsC(j) = accumulator(j + i * elems);
+            }
+            __syncthreads();
+            const auto rIdx = threadIdx.x / elems * elems;
+            const auto cIdx = threadIdx.x % elems;
+            #pragma unroll
+            for (unsigned int j = 0; j < elems; ++j) {
+                accumulator(j + i * elems) = sC(rIdx + j, cIdx);
+            }
+        }
+
+        const auto rIdx = threadIdx.x / elems * elems;
+        const auto cIdx = threadIdx.x % elems;
+        #pragma unroll
+        for (uint i = 0; i < trips; ++i) {
+            #pragma unroll
+            for (unsigned int j = 0; j < elems; ++j) {
+                rC(j + i * elems) = gCStoreOp(accumulator(j + i * elems));
+            }
+        }
+        #pragma unroll
+        for (uint i = 0; i < trips; ++i) {
+            #pragma unroll
+            for (unsigned int j = 0; j < elems; ++j) {
+                gC(rIdx + j, cIdx + i * elems) = rC(j + i * elems);
+            }
+        }
+    }
 
     struct __align__(16) ProcessorArgs{
         // sensible sentinel values
@@ -1555,10 +1756,9 @@ namespace flashmoe::processor{
 //                                        tNx + 1, rCurrentTask.syncIdx);
 // #endif
                             }
-                            rCurrentTask.cData[0] = CAST_TO(cuda::std::byte, bookkeeping.gGateCombine());
-                            rCurrentTask.bData[0] = CONST_CAST_TO(cuda::std::byte, flashmoe::moe::hiddenStatesPtr);
-                            rCurrentTask.bData[1] = CONST_CAST_TO(cuda::std::byte, flashmoe::moe::gateWeightsPtr);
-                            rCurrentTask.dData[0] = CAST_TO(cuda::std::byte, flashmoe::moe::gradInputBasePtr);
+                            //   - cData[0] = xMLocation (split gradient output buffer)
+                            //   - bData = [W1, W2] weights
+                            //   - dData = [z1, z2] saved activations
 #if FLASHMOE_DEBUG
                             if (!threadIdx.x && blockIdx.x < 2) {
                                 printf("DEBUG gradCombine ENQUEUE: block=%u syncIdx=%u combineSyncIdx=%u remote=%u CALLING notifyGradient...\n",
@@ -1567,22 +1767,26 @@ namespace flashmoe::processor{
 #endif
                             if (!rCurrentTask.isPeerRemote) {
                                 notifyGradient<PeerConnectivity::p2p>(CAST_TO(uint, workspace), rCurrentTask, pA);
-#if FLASHMOE_DEBUG
-                                if (!threadIdx.x && blockIdx.x < 2) {
-                                    printf("DEBUG gradCombine ENQUEUE: block=%u syncIdx=%u CALLING notifyGateGradient...\n",
-                                           blockIdx.x, rCurrentTask.syncIdx);
-                                }
-#endif
-                                notifyGateGradient<PeerConnectivity::p2p>(CAST_TO(uint, workspace), rCurrentTask, pA);
                             }
                             else {
                                 notifyGradient<PeerConnectivity::remote>(CAST_TO(uint, workspace), rCurrentTask, pA);
+                            }
+
+                            rCurrentTask.cData[0] = CAST_TO(cuda::std::byte, bookkeeping.gGateCombine());
+                            rCurrentTask.bData[0] = CONST_CAST_TO(cuda::std::byte, flashmoe::moe::hiddenStatesPtr);
+                            rCurrentTask.bData[1] = CONST_CAST_TO(cuda::std::byte, flashmoe::moe::gateWeightsPtr);
+                            rCurrentTask.dData[0] = CAST_TO(cuda::std::byte, flashmoe::moe::gradInputBasePtr);
+
 #if FLASHMOE_DEBUG
-                                if (!threadIdx.x && blockIdx.x < 2) {
-                                    printf("DEBUG gradCombine ENQUEUE: block=%u syncIdx=%u CALLING notifyGateGradient...\n",
-                                           blockIdx.x, rCurrentTask.syncIdx);
-                                }
+                            if (!threadIdx.x && blockIdx.x < 2) {
+                                printf("DEBUG gradCombine ENQUEUE: block=%u syncIdx=%u CALLING notifyGateGradient...\n",
+                                       blockIdx.x, rCurrentTask.syncIdx);
+                            }
 #endif
+                            if (!rCurrentTask.isPeerRemote) {
+                                notifyGateGradient<PeerConnectivity::p2p>(CAST_TO(uint, workspace), rCurrentTask, pA);
+                            }
+                            else {
                                 notifyGateGradient<PeerConnectivity::remote>(CAST_TO(uint, workspace), rCurrentTask, pA);
                             }
 #if FLASHMOE_DEBUG
@@ -1686,11 +1890,6 @@ namespace flashmoe::processor{
                         }
 #endif
                         __syncthreads();
-                        rCurrentTask.cData[gradIndex] = CAST_TO(cuda::std::byte, gateBuffer);
-                        rCurrentTask.bData[0] = CONST_CAST_TO(cuda::std::byte, flashmoe::moe::hiddenStatesPtr);
-                        rCurrentTask.bData[1] = CONST_CAST_TO(cuda::std::byte, flashmoe::moe::gateWeightsPtr);
-                        // Set dData[0] for gradGateGEMM to write input gradients
-                        rCurrentTask.dData[0] = CAST_TO(cuda::std::byte, flashmoe::moe::gradInputBasePtr);
                         if (!threadIdx.x) {
                             __threadfence();
                             // gradPostGEMM uses tQS[0, gtQCl), combine tasks use tQS[gtQCl, 2*gtQCl)
@@ -1723,12 +1922,24 @@ namespace flashmoe::processor{
                                        tNx + 1, rCurrentTask.syncIdx);
                             }
 #endif
+                            //   - cData[0] = xMLocation (split gradient output buffer)
+                            //   - bData = [W1, W2] weights
+                            //   - dData = [z1, z2] saved activations
                             if (!rCurrentTask.isPeerRemote) {
                                 notifyGradient<PeerConnectivity::p2p>(CAST_TO(uint, workspace), rCurrentTask, pA);
-                                notifyGateGradient<PeerConnectivity::p2p>(CAST_TO(uint, workspace), rCurrentTask, pA);
                             }
                             else {
                                 notifyGradient<PeerConnectivity::remote>(CAST_TO(uint, workspace), rCurrentTask, pA);
+                            }
+                            rCurrentTask.cData[gradIndex] = CAST_TO(cuda::std::byte, gateBuffer);
+                            rCurrentTask.bData[0] = CONST_CAST_TO(cuda::std::byte, flashmoe::moe::hiddenStatesPtr);
+                            rCurrentTask.bData[1] = CONST_CAST_TO(cuda::std::byte, flashmoe::moe::gateWeightsPtr);
+                            rCurrentTask.dData[0] = CAST_TO(cuda::std::byte, flashmoe::moe::gradInputBasePtr);
+
+                            if (!rCurrentTask.isPeerRemote) {
+                                notifyGateGradient<PeerConnectivity::p2p>(CAST_TO(uint, workspace), rCurrentTask, pA);
+                            }
+                            else {
                                 notifyGateGradient<PeerConnectivity::remote>(CAST_TO(uint, workspace), rCurrentTask, pA);
                             }
 #if FLASHMOE_DEBUG
@@ -1845,17 +2056,13 @@ namespace flashmoe::processor{
                         constexpr unsigned int w2Index = 1;
                         constexpr unsigned int w1Index = 0;
                         const Element* z2Activation = nullptr;
-                        long long xMOffset2 = 0;
-                        long long rowIdx2 = 0;
-                        {
-                            auto* xMBase = CAST_TO(Element, bookkeeping.xM());
-                            auto* xMPtr = CAST_TO(Element, rCurrentTask.cData[w1Index]);
-                            // Compute row index in xM (which has P columns)
-                            xMOffset2 = xMPtr - xMBase;
-                            rowIdx2 = xMOffset2 / P;
-                            // z2 has H columns, so offset is rowIdx * H
-                            z2Activation = bookkeeping.z2() + rowIdx2 * H;
-                        }
+                        const Element* a1Activation = nullptr;
+                        auto* xMBase = CAST_TO(Element, bookkeeping.xM());
+                        auto* xMPtr = CAST_TO(Element, rCurrentTask.cData[w1Index]);
+                        const auto xMOffset2 = xMPtr - xMBase;
+                        const auto rowIdx2 = xMOffset2 / P;
+                        z2Activation = bookkeeping.z2() + rowIdx2 * H;
+                        a1Activation = xMPtr;
 #if FLASHMOE_DEBUG
                         if (!threadIdx.x && blockIdx.x < 3) {
                             auto* z2Base = bookkeeping.z2();
@@ -1864,14 +2071,28 @@ namespace flashmoe::processor{
                                    xMOffset2, rowIdx2, z2Base, z2Activation, rCurrentTask.cData[w1Index]);
                         }
 #endif
-                        fGET<GradPostGEMM, ACC::H::value, ACC::P::value>(
+                        // grad_output [M, H], z2 [M, H] (K=H), W2_stored [H, P] (K=H, N=P), output [M, P]
+                        fGETGrad<GradPostGEMM, ACC::P::value, ACC::H::value>(
                             CAST_TO(typename GradPostGEMM::MatrixDType, workspace),
-                            CONST_CAST_TO(typename GradPostGEMM::MatrixAType, rCurrentTask.aData),
-                            CONST_CAST_TO(typename GradPostGEMM::MatrixBType, rCurrentTask.bData[w2Index]),
-                            CAST_TO(typename GradPostGEMM::MatrixDType, rCurrentTask.cData[w2Index]),
-                            CONST_CAST_TO(typename GradPostGEMM::MatrixDType, z2Activation),
+                            CONST_CAST_TO(typename GradPostGEMM::MatrixAType, rCurrentTask.aData),  // grad_output [M, H]
+                            CONST_CAST_TO(typename GradPostGEMM::MatrixBType, rCurrentTask.bData[w2Index]),  // W2 [H, P]
+                            CAST_TO(typename GradPostGEMM::MatrixDType, rCurrentTask.cData[w2Index]),  // output [M, P]
+                            CONST_CAST_TO(typename GradPostGEMM::MatrixDType, z2Activation),  // z2 [M, H] (K=H)
                             rCurrentTask.M,
                             rCurrentTask.tileIdx);
+                        {
+                            const auto localExpertIdx = rCurrentTask.expertIdx;
+                            constexpr auto expertStride = 2 * P * H + P + H;
+                            auto* const weightGradBuffer = CAST_TO(Element, bookkeeping.gW()) + localExpertIdx * expertStride;
+                            auto* const dW2Buffer = weightGradBuffer + P * H;
+                            computeWeightGradients<H, P>(
+                                workspace,
+                                CONST_CAST_TO(Element, rCurrentTask.aData),  // grad_z2 [M, H]
+                                CONST_CAST_TO(Element, a1Activation),        // a1 [M, P] from xM()
+                                dW2Buffer,
+                                rCurrentTask.tileSize,
+                                static_cast<uint16_t>(localExpertIdx));
+                        }
                         __syncthreads();
                         if (!threadIdx.x) {
                             __threadfence();
@@ -1928,12 +2149,13 @@ namespace flashmoe::processor{
                                    rCurrentTask.aData, rCurrentTask.cData[w1Index]);
                         }
 #endif
-                        fGET<GradPreGEMM, ACC::P::value, ACC::H::value>(
+                        // grad_a1 [M, P], z1 [M, P] (K=P), W1_stored [P, H] (K=P, N=H), output [M, H]
+                        fGETGrad<GradPreGEMM, ACC::H::value, ACC::P::value>(
                             CAST_TO(typename GradPreGEMM::MatrixDType, workspace),
-                            CONST_CAST_TO(typename GradPreGEMM::MatrixAType, rCurrentTask.aData),
-                            CONST_CAST_TO(typename GradPreGEMM::MatrixBType, rCurrentTask.bData[w1Index]),
-                            CAST_TO(typename GradPreGEMM::MatrixDType, rCurrentTask.cData[w1Index]),
-                            CONST_CAST_TO(typename GradPreGEMM::MatrixDType, z1Activation),
+                            CONST_CAST_TO(typename GradPreGEMM::MatrixAType, rCurrentTask.aData),  // grad_a1 [M, P]
+                            CONST_CAST_TO(typename GradPreGEMM::MatrixBType, rCurrentTask.bData[w1Index]),  // W1 [P, H]
+                            CAST_TO(typename GradPreGEMM::MatrixDType, rCurrentTask.cData[w1Index]),  // output [M, H]
+                            CONST_CAST_TO(typename GradPreGEMM::MatrixDType, z1Activation),  // z1 [M, P] (K=P)
                             rCurrentTask.M,
                             rCurrentTask.tileIdx);
                         __syncthreads();

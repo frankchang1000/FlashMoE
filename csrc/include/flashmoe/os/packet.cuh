@@ -617,8 +617,8 @@ namespace flashmoe::packet {
                 tileIdx,
                 expertIdx
             };
-            gradTask.cData[0] = xMLocation;
-            gradTask.cData[1] = const_cast<cuda::std::byte*>(packet);
+            gradTask.cData[0] = const_cast<cuda::std::byte*>(packet);  // [M, H]
+            gradTask.cData[1] = xMLocation;                            // [M, P]
             gradTask.syncIdx = syncIdx;
             gradTask.M = padM;
             gradTask.peerIdx = peerIdx;
@@ -664,7 +664,7 @@ namespace flashmoe::packet {
                     tileIdx,
                     expertIdx
                 };
-                inputTask.cData[0] = xMLocation;     // Source: grad_input from xM (P2P accessible)
+                inputTask.cData[0] = const_cast<cuda::std::byte*>(packet);  // Source: grad_input [M, H]
                 inputTask.syncIdx = syncIdx;
                 inputTask.M = padM;
                 inputTask.peerIdx = peerIdx;
@@ -771,8 +771,8 @@ namespace flashmoe::packet {
                     i,
                     expertIdx
                 };
-                gradTask.cData[0] = xMLocation;
-                gradTask.cData[1] = const_cast<cuda::std::byte*>(packet);
+                gradTask.cData[0] = const_cast<cuda::std::byte*>(packet);  // [M, H]
+                gradTask.cData[1] = xMLocation;                            // [M, P]
                 gradTask.syncIdx = syncIdx;
                 gradTask.M = padM;
                 gradTask.peerIdx = peerIdx;
@@ -821,8 +821,8 @@ namespace flashmoe::packet {
                         i,
                         expertIdx
                     };
-                    inputTask.cData[0] = xMLocation;
-                    inputTask.cData[1] = const_cast<cuda::std::byte*>(packet);  // heap location
+                    inputTask.cData[0] = const_cast<cuda::std::byte*>(packet);  // grad_input [M, H]
+                    inputTask.cData[1] = const_cast<cuda::std::byte*>(packet);  // heap location (used)
                     inputTask.syncIdx = inputSyncIdx;
                     inputTask.M = padM;
                     inputTask.peerIdx = peerIdx;
