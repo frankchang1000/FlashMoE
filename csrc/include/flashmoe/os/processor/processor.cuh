@@ -1348,8 +1348,8 @@ namespace flashmoe::processor{
                                blockIdx.x, taskTypeVal, rCurrentTask.syncIdx, rCurrentTask.tileIdx,
                                rCurrentTask.batchIdx, rCurrentTask.aData);
                     } else if (taskTypeVal >= 3) { // gradient tasks start at 3 (gradPreGEMM)
-                        printf("DEBUG processor TASK: block=%u type=%u tile=%u syncIdx=%u batchIdx=%u\n",
-                               blockIdx.x, taskTypeVal, rCurrentTask.tileIdx, rCurrentTask.syncIdx,
+                        printf("DEBUG processor TASK: rank=%d block=%u type=%u tile=%u syncIdx=%u batchIdx=%u\n",
+                               nvshmem_my_pe(), blockIdx.x, taskTypeVal, rCurrentTask.tileIdx, rCurrentTask.syncIdx,
                                rCurrentTask.batchIdx);
                     }
                 }
@@ -1536,10 +1536,29 @@ namespace flashmoe::processor{
                             // P2P: 1 gradCombine + 1 gradGateCombine = 2 tasks per syncIdx
                             // Remote: tNx gradCombine + tNx gradGateCombine = 2*tNx tasks per syncIdx
                             const auto threshold = rCurrentTask.isPeerRemote ? 2 * tNx : 2;
+// #if FLASHMOE_DEBUG
+//                             const auto priorCount = atomicAdd(pA.tQS + combineSyncIdx, 0U);
+//                             printf("DEBUG gradCombine SYNC: block=%u syncIdx=%u combineSyncIdx=%u gtQCl=%u "
+//                                    "priorCount=%u threshold=%u remote=%u expert=%u tile=%u\n",
+//                                    blockIdx.x, rCurrentTask.syncIdx, combineSyncIdx, bookkeeping.gtQCl,
+//                                    priorCount, threshold, rCurrentTask.isPeerRemote, rCurrentTask.expertIdx,
+//                                    rCurrentTask.tileIdx);
+// #endif
                             enqueue = atomicAdd(pA.tQS + combineSyncIdx, 1U) + 1 == threshold;
                         }
                         __syncthreads();
                         if (enqueue) {
+                            // Clear sync counter so the same syncIdx can trigger again for the next packet
+                            if (!threadIdx.x) {
+                                const auto combineSyncIdx = rCurrentTask.syncIdx + bookkeeping.gtQCl;
+                                atomicExch(pA.tQS + combineSyncIdx, 0U);
+// #if FLASHMOE_DEBUG
+//                                 printf("DEBUG gradCombine TRIGGERED: block=%u combineSyncIdx=%u "
+//                                        "threshold=%u -> emit gradPostGEMM/gradGateGEMM with syncIdx=%u\n",
+//                                        blockIdx.x, combineSyncIdx,
+//                                        rCurrentTask.isPeerRemote ? 2 * tNx : 2, rCurrentTask.syncIdx);
+// #endif
+                            }
                             rCurrentTask.cData[0] = CAST_TO(cuda::std::byte, bookkeeping.gGateCombine());
                             rCurrentTask.bData[0] = CONST_CAST_TO(cuda::std::byte, flashmoe::moe::hiddenStatesPtr);
                             rCurrentTask.bData[1] = CONST_CAST_TO(cuda::std::byte, flashmoe::moe::gateWeightsPtr);
@@ -1594,45 +1613,89 @@ namespace flashmoe::processor{
                         // Use global gateBuffer - write directly to correct token positions using tokenIdx from TPS
                         auto* __restrict__ const gateBuffer = bookkeeping.gGateCombine();
                         auto* __restrict__ const tokenIds = CONST_CAST_TO(TPS, rCurrentTask.aData);
+                        auto* __restrict__ const packetBase = CONST_CAST_TO(Element, rCurrentTask.cData[gradIndex]);
                         constexpr auto threads = ACC::PeakHardware::OS::threads::value;
-                        constexpr auto convertProb = cutlass::NumericConverter<Element, mp_t>{};
                         constexpr auto toCompute = cutlass::NumericConverter<ComputeElement, Element>{};
                         constexpr auto toElement = cutlass::NumericConverter<Element, ComputeElement>{};
                         using NativeElement = typename ToCDx<Element>::T;
                         constexpr auto convertNative = cutlass::NumericConverter<NativeElement, Element>{};
-// #if FLASHMOE_DEBUG
-//                         if (!threadIdx.x) {
-//                             printf("DEBUG gradGateCombine ENTER: block=%u tile=%u tileSize=%u S=%u E=%u H=%u expert=%u\n",
-//                                    blockIdx.x, rCurrentTask.tileIdx, tileSize, S, E, H, rCurrentTask.expertIdx);
-//                             printf("DEBUG gradGateCombine PTRS: gradOut=%p gateBuffer=%p tokenIds=%p\n",
-//                                    gradOut, gateBuffer, tokenIds);
-//                         }
-// #endif
+                        constexpr auto tokensPerTile = static_cast<size_t>(BLOCK_M);
+                        constexpr auto hiddenStride = static_cast<size_t>(H);
+                        const auto tileRowOffset = static_cast<size_t>(rCurrentTask.tileIdx) * tokensPerTile * hiddenStride;
+#if FLASHMOE_DEBUG
+                        if (!threadIdx.x && blockIdx.x < 2) {
+                            printf("DEBUG gradGateCombine ENTER: block=%u tile=%u tileSize=%u S=%u E=%u H=%u expert=%u "
+                                   "gradOut=%p gateBuffer=%p tokenIds=%p packetBase=%p "
+                                   "tokensPerTile=%lu hiddenStride=%lu tileRowOffset=%lu\n",
+                                   blockIdx.x, rCurrentTask.tileIdx, tileSize, S, E, H, rCurrentTask.expertIdx,
+                                   gradOut, gateBuffer, tokenIds, packetBase,
+                                   tokensPerTile, hiddenStride, tileRowOffset);
+                        }
+#endif
                         // No per-tile zeroing needed - gateBuffer is pre-zeroed in bootstrap
                         // Write directly to global positions using tokenIdx from TPS array
                         for (uint idx = threadIdx.x; idx < tileSize; idx += threads) {
                             const auto tokenEntry = tokenIds[idx];
                             const auto tokenIdx = tokenEntry.tokenIdx;
                             if (tokenIdx >= S) {
-// #if FLASHMOE_DEBUG
-//                                 if (!threadIdx.x) {
-//                                     printf("DEBUG gradGateCombine: block=%u SKIP tokenIdx=%u >= S=%u\n",
-//                                            blockIdx.x, tokenIdx, S);
-//                                 }
-// #endif
+#if FLASHMOE_DEBUG
+                                if (!threadIdx.x) {
+                                    printf("DEBUG gradGateCombine: block=%u SKIP tokenIdx=%u >= S=%u\n",
+                                           blockIdx.x, tokenIdx, S);
+                                }
+#endif
                                 continue;
                             }
+                            const auto rowOffset = tileRowOffset + static_cast<size_t>(idx) * hiddenStride;
+                            const auto* __restrict__ const expertRow = packetBase + rowOffset;
                             ComputeElement gradSum = ComputeElement(0);
                             #pragma unroll
                             for (uint n = 0; n < H; ++n) {
-                                gradSum = fmaf(toCompute(mGradOut(tokenIdx, n)), ComputeElement(1), gradSum);
+                                gradSum = fmaf(toCompute(mGradOut(tokenIdx, n)), toCompute(expertRow[n]), gradSum);
                             }
-                            const auto probVal = convertProb(tokenEntry.probability);
-                            const auto routingVal = probVal * toElement(gradSum);
+                            const auto routingVal = toElement(gradSum);
+#if FLASHMOE_DEBUG
+                            if (blockIdx.x < 2 && idx < 2) {
+                                const float go0 = static_cast<float>(mGradOut(tokenIdx, 0));
+                                const float go1 = static_cast<float>(mGradOut(tokenIdx, 1));
+                                const float go2 = static_cast<float>(mGradOut(tokenIdx, 2));
+                                const float go3 = static_cast<float>(mGradOut(tokenIdx, 3));
+                                const float er0 = static_cast<float>(expertRow[0]);
+                                const float er1 = static_cast<float>(expertRow[1]);
+                                const float er2 = static_cast<float>(expertRow[2]);
+                                const float er3 = static_cast<float>(expertRow[3]);
+                                printf("DEBUG gradGateCombine DOT: block=%u idx=%u tokenIdx=%u rowOffset=%lu expert=%u\n",
+                                       blockIdx.x, idx, tokenIdx, rowOffset, rCurrentTask.expertIdx);
+                                printf("  gradOut[%u,0..3]=[%.4f,%.4f,%.4f,%.4f]\n",
+                                       tokenIdx, go0, go1, go2, go3);
+                                printf("  expertRow[0..3]=[%.4f,%.4f,%.4f,%.4f]\n",
+                                       er0, er1, er2, er3);
+                                printf("  gradSum(dotProduct)=%.6f routingVal=%.6f slot=%p\n",
+                                       static_cast<float>(gradSum), static_cast<float>(routingVal),
+                                       gateBuffer + tokenIdx * E + rCurrentTask.expertIdx);
+                            }
+#endif
                             // Write to global position: gateBuffer[tokenIdx, expertIdx]
                             auto* const slot = gateBuffer + tokenIdx * E + rCurrentTask.expertIdx;
                             atomicAdd(CAST_TO(NativeElement, slot), convertNative(routingVal));
                         }
+#if FLASHMOE_DEBUG
+                        __syncthreads();
+                        if (!threadIdx.x && blockIdx.x < 2) {
+                            const auto firstTokenIdx = tokenIds[0].tokenIdx;
+                            if (firstTokenIdx < S) {
+                                const auto* gateRow = gateBuffer + firstTokenIdx * E;
+                                printf("DEBUG gradGateCombine SUMMARY: block=%u tile=%u firstToken=%u expert=%u\n",
+                                       blockIdx.x, rCurrentTask.tileIdx, firstTokenIdx, rCurrentTask.expertIdx);
+                                printf("  gateBuffer[%u, 0..min(4,E)]=[%.6f,%.6f,%.6f,%.6f]\n",
+                                       firstTokenIdx,
+                                       static_cast<float>(gateRow[0]),
+                                       E > 1 ? static_cast<float>(gateRow[1]) : 0.0f,
+                                       E > 2 ? static_cast<float>(gateRow[2]) : 0.0f,
+                                       E > 3 ? static_cast<float>(gateRow[3]) : 0.0f);
+                            }
+                        }
+#endif
                         __syncthreads();
                         if (!threadIdx.x) {
                             // Pass global gateBuffer base to gradGateGEMM (not tile-offset)
@@ -1649,39 +1712,42 @@ namespace flashmoe::processor{
                             // P2P: 1 gradCombine + 1 gradGateCombine = 2 tasks per syncIdx
                             // Remote: tNx gradCombine + tNx gradGateCombine = 2*tNx tasks per syncIdx
                             const auto threshold = rCurrentTask.isPeerRemote ? 2 * tNx : 2;
+// #if FLASHMOE_DEBUG
+//                             const auto priorCount = atomicAdd(pA.tQS + combineSyncIdx, 0U);
+//                             printf("DEBUG gradGateCombine SYNC: block=%u syncIdx=%u combineSyncIdx=%u "
+//                                    "priorCount=%u threshold=%u remote=%u expert=%u tile=%u\n",
+//                                    blockIdx.x, rCurrentTask.syncIdx, combineSyncIdx,
+//                                    priorCount, threshold, rCurrentTask.isPeerRemote, rCurrentTask.expertIdx,
+//                                    rCurrentTask.tileIdx);
+// #endif
                             enqueue = atomicAdd(pA.tQS + combineSyncIdx, 1U) + 1 == threshold;
                         }
                         __syncthreads();
                         if (enqueue) {
+                            // Clear sync counter so the same syncIdx can trigger again for the next packet
+                            if (!threadIdx.x) {
+                                const auto combineSyncIdx = rCurrentTask.syncIdx + bookkeeping.gtQCl;
+                                atomicExch(pA.tQS + combineSyncIdx, 0U);
+                            }
 #if FLASHMOE_DEBUG
                             if (!threadIdx.x && blockIdx.x < 2) {
-                                printf("DEBUG gradGateCombine ENQUEUE: block=%u syncIdx=%u combineSyncIdx=%u remote=%u CALLING notifyGradient...\n",
-                                       blockIdx.x, rCurrentTask.syncIdx, rCurrentTask.syncIdx + bookkeeping.gtQCl, rCurrentTask.isPeerRemote);
+                                printf("DEBUG gradGateCombine TRIGGERED: block=%u combineSyncIdx=%u "
+                                       "threshold=%u -> emit gradPostGEMM/gradGateGEMM with syncIdx=%u\n",
+                                       blockIdx.x, rCurrentTask.syncIdx + bookkeeping.gtQCl,
+                                       rCurrentTask.isPeerRemote ? 2 * tNx : 2, rCurrentTask.syncIdx);
                             }
 #endif
                             if (!rCurrentTask.isPeerRemote) {
                                 notifyGradient<PeerConnectivity::p2p>(CAST_TO(uint, workspace), rCurrentTask, pA);
-#if FLASHMOE_DEBUG
-                                if (!threadIdx.x && blockIdx.x < 2) {
-                                    printf("DEBUG gradGateCombine ENQUEUE: block=%u syncIdx=%u CALLING notifyGateGradient...\n",
-                                           blockIdx.x, rCurrentTask.syncIdx);
-                                }
-#endif
                                 notifyGateGradient<PeerConnectivity::p2p>(CAST_TO(uint, workspace), rCurrentTask, pA);
                             }
                             else {
                                 notifyGradient<PeerConnectivity::remote>(CAST_TO(uint, workspace), rCurrentTask, pA);
-#if FLASHMOE_DEBUG
-                                if (!threadIdx.x && blockIdx.x < 2) {
-                                    printf("DEBUG gradGateCombine ENQUEUE: block=%u syncIdx=%u CALLING notifyGateGradient...\n",
-                                           blockIdx.x, rCurrentTask.syncIdx);
-                                }
-#endif
                                 notifyGateGradient<PeerConnectivity::remote>(CAST_TO(uint, workspace), rCurrentTask, pA);
                             }
 #if FLASHMOE_DEBUG
                             if (!threadIdx.x && blockIdx.x < 2) {
-                                printf("DEBUG gradGateCombine ENQUEUE: block=%u syncIdx=%u DONE both notifications\n",
+                                printf("DEBUG gradGateCombine ENQUEUE: block=%u syncIdx=%u DONE notifications\n",
                                        blockIdx.x, rCurrentTask.syncIdx);
                             }
 #endif
@@ -1814,11 +1880,18 @@ namespace flashmoe::processor{
                         __syncthreads();
                         if (!threadIdx.x) {
                             __threadfence();
+// #if FLASHMOE_DEBUG
+//                             const auto priorCount = atomicAdd(pA.tQS + rCurrentTask.syncIdx, 0U);
+//                             printf("DEBUG gradPostGEMM SYNC: block=%u syncIdx=%u (combine used %u+gtQCl) "
+//                                    "priorCount=%u tN=%u expert=%u tile=%u\n",
+//                                    blockIdx.x, rCurrentTask.syncIdx, rCurrentTask.syncIdx,
+//                                    priorCount, tN, rCurrentTask.expertIdx, rCurrentTask.tileIdx);
+// #endif
                             enqueue = atomicAdd(pA.tQS + rCurrentTask.syncIdx, 1U) + 1 == tN;
 #if FLASHMOE_DEBUG
-                            if (blockIdx.x < 3) {
-                                printf("DEBUG gradPostGEMM block=%u syncIdx=%u tN=%u enqueue=%u\n",
-                                       blockIdx.x, rCurrentTask.syncIdx, tN, enqueue ? 1U : 0U);
+                            if (enqueue && blockIdx.x < 3) {
+                                printf("DEBUG gradPostGEMM TRIGGERED: block=%u syncIdx=%u reached tN=%u -> notifyGradPreGEMM\n",
+                                       blockIdx.x, rCurrentTask.syncIdx, tN);
                             }
 #endif
                         }
@@ -1854,8 +1927,8 @@ namespace flashmoe::processor{
 #if FLASHMOE_DEBUG
                         if (!threadIdx.x && blockIdx.x < 3) {
                             auto* z1Base = bookkeeping.z1();
-                            printf("DEBUG gradPreGEMM block=%u tile=%u M=%u: xMOffset=%lld z1Base=%p z1Act=%p aData=%p cData=%p\n",
-                                   blockIdx.x, rCurrentTask.tileIdx, rCurrentTask.M,
+                            printf("DEBUG gradPreGEMM rank=%d block=%u tile=%u M=%u: xMOffset=%lld z1Base=%p z1Act=%p aData=%p cData=%p\n",
+                                   nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx, rCurrentTask.M,
                                    xMOffset, z1Base, z1Activation,
                                    rCurrentTask.aData, rCurrentTask.cData[w1Index]);
                         }
@@ -1873,40 +1946,23 @@ namespace flashmoe::processor{
                             const auto peer = rCurrentTask.peerIdx;
                             const auto localExpertIdx = rCurrentTask.expertIdx;
 
-                            // DEBUG: Verify task fields
-                            if (!threadIdx.x && blockIdx.x < 3) {
-                                printf("DEBUG gradWeights TASK: block=%u peer=%u expert=%u batchIdx=%u tileSize=%u sHeap=%p gW=%p\n",
-                                       blockIdx.x, peer, localExpertIdx, rCurrentTask.batchIdx, rCurrentTask.tileSize,
-                                       bookkeeping.sHeap, bookkeeping.gW());
-                            }
-
                             // Get original input from heap (forward pass stored it at stage 0, cell 1)
                             const auto tokenOffset = rCurrentTask.batchIdx * BLOCK_M;
                             const auto* heapPtr = heap::advance<0, 1>(bookkeeping.sHeap, peer, localExpertIdx, tokenOffset);
                             const auto* originalInput = CONST_CAST_TO(typename PreGEMM::MatrixAType, heapPtr);
 
-                            if (!threadIdx.x && blockIdx.x < 3) {
-                                printf("DEBUG gradWeights PTRS: block=%u tokenOffset=%u heapPtr=%p origInput=%p aData=%p\n",
-                                       blockIdx.x, tokenOffset, heapPtr, originalInput, rCurrentTask.aData);
-                                // const auto* heapCell0 = heap::advance<0, 0>(bookkeeping.sHeap, peer, localExpertIdx, tokenOffset);
-                                // const auto* heapCell1 = heapPtr; // already cell 1
-                                // const auto* val0 = CONST_CAST_TO(Element, heapCell0);
-                                // const auto* val1 = CONST_CAST_TO(Element, heapCell1);
-                                // printf("DEBUG BWD_HEAP_COMPARE: block=%u peer=%u expert=%u token=%u cell0=%p val0[0]=%.6f cell1=%p val1[0]=%.6f\n",
-                                //        blockIdx.x, peer, localExpertIdx, tokenOffset, heapCell0, static_cast<float>(val0[0]), heapCell1, static_cast<float>(val1[0]));
-                            }
-
                             constexpr auto expertStride = 2 * P * H + P + H;
                             auto* const weightGradBuffer = CAST_TO(Element, bookkeeping.gW()) + localExpertIdx * expertStride;
 
                             if (!threadIdx.x && blockIdx.x < 3) {
-                                printf("DEBUG gradWeights BUF: block=%u expertStride=%u buffer=%p\n",
-                                       blockIdx.x, expertStride, weightGradBuffer);
+                                printf("DEBUG gradWeights: rank=%d block=%u peer=%u expert=%u batchIdx=%u tileSize=%u tokenOff=%u stride=%u heap=%p orig=%p aData=%p buf=%p\n",
+                                       nvshmem_my_pe(), blockIdx.x, peer, localExpertIdx, rCurrentTask.batchIdx, rCurrentTask.tileSize,
+                                       tokenOffset, expertStride, heapPtr, originalInput, rCurrentTask.aData, weightGradBuffer);
                             }
 #if FLASHMOE_DEBUG
                             if (!threadIdx.x && blockIdx.x < 3) {
-                                printf("DEBUG gradPreGEMM->gradWeights DIRECT: block=%u peer=%u localExpert=%u tileSize=%u tileIdx=%u tokenOffset=%u gW=%p buffer=%p aData=%p origInput=%p\n",
-                                       blockIdx.x, peer, localExpertIdx, rCurrentTask.tileSize, rCurrentTask.tileIdx, tokenOffset,
+                                printf("DEBUG gradPreGEMM->gradWeights DIRECT: rank=%d block=%u peer=%u localExpert=%u tileSize=%u tileIdx=%u tokenOffset=%u gW=%p buffer=%p aData=%p origInput=%p\n",
+                                       nvshmem_my_pe(), blockIdx.x, peer, localExpertIdx, rCurrentTask.tileSize, rCurrentTask.tileIdx, tokenOffset,
                                        bookkeeping.gW(), weightGradBuffer, rCurrentTask.aData, originalInput);
                             }
 #endif
@@ -1923,8 +1979,8 @@ namespace flashmoe::processor{
                             __syncthreads();
 #if FLASHMOE_DEBUG
                             if (!threadIdx.x && blockIdx.x < 3) {
-                                printf("DEBUG gradPreGEMM->gradWeights COMPLETE: block=%u localExpert=%u buffer[0]=%.6f\n",
-                                       blockIdx.x, localExpertIdx, static_cast<float>(weightGradBuffer[0]));
+                                printf("DEBUG gradPreGEMM->gradWeights COMPLETE: rank=%d block=%u localExpert=%u buffer[0]=%.6f\n",
+                                       nvshmem_my_pe(), blockIdx.x, localExpertIdx, static_cast<float>(weightGradBuffer[0]));
                             }
 #endif
                         }
