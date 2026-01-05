@@ -923,7 +923,8 @@ namespace flashmoe::processor{
     template<TaskType TaskT,
         PeerConnectivity p,
         unsigned int tasks = ACC::TNx::value,
-        unsigned int gradIndex = 0>  // Which cData index to use as new task's aData
+        unsigned int gradIndex = 0,  // Which cData index to use as new task's aData
+        bool preserveAData = false>  // When true, use rCurrentTask.aData directly instead of cData[gradIndex]
     __device__ __forceinline__
     void notifyGradientImpl(uint* __restrict__ const& workspace, const Task& rCurrentTask, const ProcessorArgs& pA) {
         static_assert(sizeof(Task) == 128);
@@ -963,9 +964,10 @@ namespace flashmoe::processor{
             for (uint i = 0; i < trips; ++i) {
                 const auto taskIdx = threadIdx.x + i * capacity;
                 const auto tileIdx = offset + taskIdx;
+                const auto nextAData = preserveAData ? rCurrentTask.aData : rCurrentTask.cData[gradIndex];
                 const auto nextTask = Task {
                     TaskT,
-                    rCurrentTask.cData[gradIndex],
+                    nextAData,
                     rCurrentTask.bData,
                     rCurrentTask.cData,
                     rCurrentTask.dData,
@@ -998,9 +1000,10 @@ namespace flashmoe::processor{
             if (threadIdx.x < residue) {
                 const auto taskIdx = threadIdx.x + trips * capacity;
                 const auto tileIdx = offset + taskIdx;
+                const auto nextAData = preserveAData ? rCurrentTask.aData : rCurrentTask.cData[gradIndex];
                 const auto nextTask = Task {
                     TaskT,
-                    rCurrentTask.cData[gradIndex],
+                    nextAData,
                     rCurrentTask.bData,
                     rCurrentTask.cData,
                     rCurrentTask.dData,
@@ -1071,7 +1074,7 @@ namespace flashmoe::processor{
     >
     __device__ __forceinline__
     void notifyGateGradient(uint* __restrict__ const& workspace, const Task& rCurrentTask, const ProcessorArgs& pA) {
-        notifyGradientImpl<TaskType::gradGateGEMM, p, tasks>(workspace, rCurrentTask, pA);
+        notifyGradientImpl<TaskType::gradGateGEMM, p, tasks, 0, true>(workspace, rCurrentTask, pA);
     }
 
     // gradPostGEMM output (grad_intermediate in cData[1]) becomes gradPreGEMM input
