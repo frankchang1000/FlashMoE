@@ -634,21 +634,23 @@ namespace flashmoe::packet {
 // #endif
             emitTask(gradTask);
 
-            Task gateTask{
-                TaskType::gradGateCombine,
-                tokenIndices,
-                cuda::std::array<const cuda::std::byte*, GEMMs>{packet},
-                nTokens,
-                tileIdx,
-                expertIdx
-            };
-            gateTask.cData[0] = const_cast<cuda::std::byte*>(packet);
-            gateTask.syncIdx = syncIdx;
-            gateTask.M = padM;
-            gateTask.peerIdx = peerIdx;
-            gateTask.batchIdx = batchIdx;
-            gateTask.isPeerRemote = false;
-            emitTask(gateTask);
+            if (tileIdx == 0) {
+                Task gateTask{
+                    TaskType::gradGateCombine,
+                    tokenIndices,
+                    cuda::std::array<const cuda::std::byte*, GEMMs>{packet},
+                    nTokens,
+                    0,
+                    expertIdx
+                };
+                gateTask.cData[0] = const_cast<cuda::std::byte*>(packet);
+                gateTask.syncIdx = syncIdx;
+                gateTask.M = padM;
+                gateTask.peerIdx = peerIdx;
+                gateTask.batchIdx = batchIdx;
+                gateTask.isPeerRemote = false;
+                emitTask(gateTask);
+            }
 
             // For remote experts (gradPreGEMM completion signals), create gradInputCombine
             // Local experts have peerIdx == epRank (initial backward signal)
@@ -783,15 +785,15 @@ namespace flashmoe::packet {
                 dA.tQ[DQ::next(qIdx, i)] = gradTask;
             }
 
-            for (uint i = 0; i < tNx; ++i) {
-                const auto gateIdx = DQ::next(qIdx, tNx + i);
-                const auto gateSyncIdx = sO + (i / TN);
+            {
+                const auto gateIdx = DQ::next(qIdx, tNx);  // After tNx gradCombine tasks
+                const auto gateSyncIdx = sO;  // Use base syncIdx
                 Task gateTask{
                     TaskType::gradGateCombine,
                     tokenIndices,
                     cuda::std::array<const cuda::std::byte*, GEMMs>{packet},
                     nTokens,
-                    i,
+                    0,
                     expertIdx
                 };
                 gateTask.cData[0] = const_cast<cuda::std::byte*>(packet);
@@ -809,7 +811,7 @@ namespace flashmoe::packet {
             const bool isRemoteExpert = (peerIdx != dA.epRank);
             if (isRemoteExpert) {
                 for (uint i = 0; i < tNx; ++i) {
-                    const auto inputIdx = DQ::next(qIdx, 2 * tNx + i);
+                    const auto inputIdx = DQ::next(qIdx, tNx + 1 + i);
                     const auto inputSyncIdx = sO + (i / TN);
                     Task inputTask{
                         TaskType::gradInputCombine,
@@ -830,7 +832,7 @@ namespace flashmoe::packet {
                 }
             }
 
-            const auto totalTasks = isRemoteExpert ? tNx * 3U : tNx * 2U;
+            const auto totalTasks = isRemoteExpert ? (tNx + 1 + tNx) : (tNx + 1);
             lTQHead += totalTasks;
             __threadfence();
             atomicAdd_block(tQHead, totalTasks);
