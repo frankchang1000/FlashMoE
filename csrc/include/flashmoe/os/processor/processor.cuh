@@ -1662,9 +1662,9 @@ namespace flashmoe::processor{
                                 const float er3 = static_cast<float>(expertRow[3]);
                                 printf("DEBUG gradGateCombine DOT: block=%u idx=%u tokenIdx=%u rowOffset=%lu expert=%u\n",
                                        blockIdx.x, idx, tokenIdx, rowOffset, rCurrentTask.expertIdx);
-                                printf("  gradOut[%u,0..3]=[%.4f,%.4f,%.4f,%.4f]\n",
+                                printf("  gradOut[%u,0..3]=[%.8e,%.8e,%.8e,%.8e]\n",
                                        tokenIdx, go0, go1, go2, go3);
-                                printf("  expertRow[0..3]=[%.4f,%.4f,%.4f,%.4f]\n",
+                                printf("  expertRow[0..3]=[%.8e,%.8e,%.8e,%.8e]\n",
                                        er0, er1, er2, er3);
                                 printf("  gradSum(dotProduct)=%.6f routingVal=%.6f slot=%p\n",
                                        static_cast<float>(gradSum), static_cast<float>(routingVal),
@@ -1683,7 +1683,7 @@ namespace flashmoe::processor{
                                 const auto* gateRow = gateBuffer + firstTokenIdx * E;
                                 printf("DEBUG gradGateCombine SUMMARY: block=%u tile=%u firstToken=%u expert=%u\n",
                                        blockIdx.x, rCurrentTask.tileIdx, firstTokenIdx, rCurrentTask.expertIdx);
-                                printf("  gateBuffer[%u, 0..min(4,E)]=[%.6f,%.6f,%.6f,%.6f]\n",
+                                printf("  gateBuffer[%u, 0..min(4,E)]=[%.8e,%.8e,%.8e,%.8e]\n",
                                        firstTokenIdx,
                                        static_cast<float>(gateRow[0]),
                                        E > 1 ? static_cast<float>(gateRow[1]) : 0.0f,
