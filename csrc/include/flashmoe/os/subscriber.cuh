@@ -180,9 +180,11 @@ namespace flashmoe::subscriber{
                         auto* nFlags = pLI.remoteSFlags + gfSfC +
                             lXI.expertIndex * (ACC::TCM::value * ACC::TNx::value);
                         if (isGradientPacket) {
+                            const auto* tokenIndices = CONST_CAST_TO(cuda::std::byte,
+                                bookkeeping.tP() + lXI.expertIndex * ACC::pEC::value);
                             gPd(dA, pLI.remoteSHeap, nFlags, packet, sP->routedTokens,
                                 myLocalExIdx, pGB, weights, savedActivations, peerIdx, pLI.pe,
-                                laneId, ltQHead, tQHead);
+                                laneId, ltQHead, tQHead, tokenIndices, lXI.expertIndex);
                         }
                         else {
                             fPd(dA, pLI.remoteSHeap, nFlags, packet, sP->routedTokens,
@@ -199,8 +201,11 @@ namespace flashmoe::subscriber{
                         auto* nFlags = dA.sFlags + gfSfC +
                                 lXI.expertIndex * (ACC::TCM::value * ACC::TNx::value);
                         if (isGradientPacket) {
+                            const auto* tokenIndices = CONST_CAST_TO(cuda::std::byte,
+                                bookkeeping.tP() + lXI.expertIndex * ACC::pEC::value);
                             gRd(dA, dA.sHeap, nFlags, packet, sP->routedTokens,
-                                myLocalExIdx, pGB, weights, savedActivations, peerIdx, pLI.pe, laneId, ltQHead, tQHead);
+                                myLocalExIdx, pGB, weights, savedActivations, peerIdx, pLI.pe,
+                                laneId, ltQHead, tQHead, tokenIndices, lXI.expertIndex);
                         }
                         else {
                             fRd(dA, dA.sHeap, nFlags, packet, sP->routedTokens,

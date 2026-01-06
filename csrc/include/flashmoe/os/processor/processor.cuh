@@ -1164,7 +1164,9 @@ namespace flashmoe::processor{
             #pragma unroll
             for (uint i = 0; i < trips; ++i) {
                 const auto taskIdx = threadIdx.x + i * capacity;
-                const auto tileIdx = offset + taskIdx;
+                // tileIdx is column tile only - cData pointers are already row-offset
+                // so fGETGrad/fGET should see tileIdx in [0, tilesN) to avoid double row offset
+                const auto tileIdx = taskIdx;
                 const auto nextAData = preserveAData ? rCurrentTask.aData : rCurrentTask.cData[gradIndex];
                 const auto nextTask = Task {
                     TaskT,
@@ -1200,7 +1202,8 @@ namespace flashmoe::processor{
         if constexpr (constexpr auto residue = tasks - trips * capacity; residue) {
             if (threadIdx.x < residue) {
                 const auto taskIdx = threadIdx.x + trips * capacity;
-                const auto tileIdx = offset + taskIdx;
+                // tileIdx is column tile only - cData pointers are already row-offset
+                const auto tileIdx = taskIdx;
                 const auto nextAData = preserveAData ? rCurrentTask.aData : rCurrentTask.cData[gradIndex];
                 const auto nextTask = Task {
                     TaskT,
@@ -1749,12 +1752,12 @@ namespace flashmoe::processor{
                             if (!threadIdx.x) {
                                 const auto combineSyncIdx = rCurrentTask.syncIdx + bookkeeping.gtQCl;
                                 atomicExch(pA.tQS + combineSyncIdx, 0U);
-// #if FLASHMOE_DEBUG
-//                                 printf("DEBUG gradCombine TRIGGERED: block=%u combineSyncIdx=%u "
-//                                        "threshold=%u -> emit gradPostGEMM/gradGateGEMM with syncIdx=%u\n",
-//                                        blockIdx.x, combineSyncIdx,
-//                                        tNx + 1, rCurrentTask.syncIdx);
-// #endif
+#if FLASHMOE_DEBUG
+                                printf("DEBUG gradCombine TRIGGERED: rank=%u block=%u combineSyncIdx=%u "
+                                       "threshold=%u -> emit gradPostGEMM/gradGateGEMM with syncIdx=%u\n", 
+                                        nvshmem_my_pe(), blockIdx.x, combineSyncIdx,
+                                       tNx + 1, rCurrentTask.syncIdx);
+#endif
                             }
                             //   - cData[0] = xMLocation (split gradient output buffer)
                             //   - bData = [W1, W2] weights
@@ -1813,7 +1816,16 @@ namespace flashmoe::processor{
                         // Use global gateBuffer - write directly to correct token positions using tokenIdx from TPS
                         auto* __restrict__ const gateBuffer = bookkeeping.gGateCombine();
                         auto* __restrict__ const tokenIds = CONST_CAST_TO(TPS, rCurrentTask.aData);
-                        auto* __restrict__ const packetBase = CONST_CAST_TO(Element, rCurrentTask.cData[gradIndex]);
+                        // Source y_e from savedZ2 instead of packet (cData[0]) to avoid race with gradCombine.
+                        // Safe when ActivationOpX is identity (typical FFN): z2 == y_e.
+                        // Derive z2 offset from xM pointer (cData[1] = rowXM) which includes expert/peer offset.
+                        constexpr auto P = ACC::P::value;
+                        auto* __restrict__ const z2Base = bookkeeping.z2();
+                        auto* __restrict__ const xMBase = CAST_TO(Element, bookkeeping.xM());
+                        auto* __restrict__ const xMPtr = CAST_TO(Element, rCurrentTask.cData[1]);  // rowXM
+                        const auto xMOffset = xMPtr - xMBase;
+                        const auto baseRowIdx = xMOffset / P;  // Includes expert/peer offset
+                        auto* __restrict__ const z2RowBase = z2Base + baseRowIdx * H;
                         constexpr auto threads = ACC::PeakHardware::OS::threads::value;
                         constexpr auto toCompute = cutlass::NumericConverter<ComputeElement, Element>{};
                         constexpr auto toElement = cutlass::NumericConverter<Element, ComputeElement>{};
@@ -1822,10 +1834,11 @@ namespace flashmoe::processor{
                         constexpr auto hiddenStride = static_cast<size_t>(H);
 #if FLASHMOE_DEBUG
                         if (!threadIdx.x && blockIdx.x < 2) {
-                            printf("DEBUG gradGateCombine ENTER: block=%u tile=%u tileSize=%u S=%u E=%u H=%u expert=%u "
-                                   "gradOut=%p gateBuffer=%p tokenIds=%p packetBase=%p hiddenStride=%lu\n",
-                                   blockIdx.x, rCurrentTask.tileIdx, tileSize, S, E, H, rCurrentTask.expertIdx,
-                                   gradOut, gateBuffer, tokenIds, packetBase, hiddenStride);
+                            printf("DEBUG gradGateCombine ENTER: rank=%u block=%u tile=%u tileSize=%u S=%u E=%u H=%u expert=%u "
+                                   "gradOut=%p gateBuffer=%p tokenIds=%p z2RowBase=%p xMOffset=%lld baseRowIdx=%lld\n",
+                                      nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx, tileSize, S, E, H, rCurrentTask.expertIdx,
+                                   gradOut, gateBuffer, tokenIds, z2RowBase,
+                                   static_cast<long long>(xMOffset), static_cast<long long>(baseRowIdx));
                         }
 #endif
                         // No per-tile zeroing needed - gateBuffer is pre-zeroed in bootstrap
@@ -1836,14 +1849,14 @@ namespace flashmoe::processor{
                             if (tokenIdx >= S) {
 #if FLASHMOE_DEBUG
                                 if (!threadIdx.x) {
-                                    printf("DEBUG gradGateCombine: block=%u SKIP tokenIdx=%u >= S=%u\n",
-                                           blockIdx.x, tokenIdx, S);
+                                    printf("DEBUG gradGateCombine: rank=%u block=%u SKIP tokenIdx=%u >= S=%u\n",
+                                           nvshmem_my_pe(), blockIdx.x, tokenIdx, S);
                                 }
 #endif
                                 continue;
                             }
                             const auto rowOffset = static_cast<size_t>(idx) * hiddenStride;
-                            const auto* __restrict__ const expertRow = packetBase + rowOffset;
+                            const auto* __restrict__ const expertRow = z2RowBase + rowOffset;
                             ComputeElement gradSum = ComputeElement(0);
                             #pragma unroll
                             for (uint n = 0; n < H; ++n) {
@@ -1860,8 +1873,8 @@ namespace flashmoe::processor{
                                 const float er1 = static_cast<float>(expertRow[1]);
                                 const float er2 = static_cast<float>(expertRow[2]);
                                 const float er3 = static_cast<float>(expertRow[3]);
-                                printf("DEBUG gradGateCombine DOT: block=%u idx=%u tokenIdx=%u rowOffset=%lu expert=%u\n",
-                                       blockIdx.x, idx, tokenIdx, rowOffset, rCurrentTask.expertIdx);
+                                printf("DEBUG gradGateCombine DOT: rank= %u block=%u idx=%u tokenIdx=%u rowOffset=%lu expert=%u\n",
+                                      nvshmem_my_pe(), blockIdx.x, idx, tokenIdx, rowOffset, rCurrentTask.expertIdx);
                                 printf("  gradOut[%u,0..3]=[%.8e,%.8e,%.8e,%.8e]\n",
                                        tokenIdx, go0, go1, go2, go3);
                                 printf("  expertRow[0..3]=[%.8e,%.8e,%.8e,%.8e]\n",
@@ -2058,7 +2071,7 @@ namespace flashmoe::processor{
                         const Element* z2Activation = nullptr;
                         const Element* a1Activation = nullptr;
                         auto* xMBase = CAST_TO(Element, bookkeeping.xM());
-                        auto* xMPtr = CAST_TO(Element, rCurrentTask.cData[w1Index]);
+                        auto* xMPtr = CAST_TO(Element, rCurrentTask.cData[w2Index]);  // cData[1] = rowXM
                         const auto xMOffset2 = xMPtr - xMBase;
                         const auto rowIdx2 = xMOffset2 / P;
                         z2Activation = bookkeeping.z2() + rowIdx2 * H;
