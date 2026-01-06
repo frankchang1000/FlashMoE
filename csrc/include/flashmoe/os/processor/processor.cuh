@@ -858,6 +858,15 @@ namespace flashmoe::processor{
             cute::Stride<cute::Int<tilesN>, cute::_1>{});
         const auto ctaCoord = make_coord(cute::get<0>(tileCoord), cute::get<1>(tileCoord), cute::_);
 
+#if FLASHMOE_DEBUG
+        if (!threadIdx.x && blockIdx.x < 2) {
+            const auto tileRow = cute::get<0>(tileCoord);
+            const auto tileCol = cute::get<1>(tileCoord);
+            printf("DEBUG fGETGrad: block=%u M=%u N=%u K=%u tileIdx=%u tileCoord=(%u,%u) savedAct=%p tilesM=%u tilesN=%u\n",
+                   blockIdx.x, M, N, K, tileIdx, tileRow, tileCol, savedActivation, tilesM, tilesN);
+        }
+#endif
+
         const auto gC = cute::local_tile(mC, typename BlockGEMM::BlockTiler{}, ctaCoord,
             cute::Step<cute::_1, cute::_1, cute::X>{});
 
@@ -1050,7 +1059,8 @@ namespace flashmoe::processor{
         constexpr unsigned int preIndex = 0;
 
         const auto offset = ACC::TNx::value * rCurrentTask.batchIdx;
-        auto* __restrict__ tQ = CAST_TO(uint, pA.ptQ + (rCurrentTask.syncIdx * ACC::TNx::value));
+        constexpr auto ptQSlotSize = ACC::TN::value + ACC::TNx::value;
+        auto* __restrict__ tQ = CAST_TO(uint, pA.ptQ + (rCurrentTask.syncIdx * ptQSlotSize));
         const auto cIdx = threadIdx.x % eS;
         // prep memory-view tensors
         const auto sTQ = make_tensor(cute::make_smem_ptr(workspace),
@@ -1428,8 +1438,8 @@ namespace flashmoe::processor{
 
 #if FLASHMOE_DEBUG
         if (!threadIdx.x && blockIdx.x < 2) {
-            printf("DEBUG computeWeightGradients: block=%u expert=%u tileSize=%u K=%u N=%u bM=%u threads=%u act=%p grad=%p buffer=%p act[0]=%.6f grad[0]=%.6f buffer[0]=%.6f totalKN=%u elemsPerThread=%u\n",
-                   blockIdx.x, expertIdx, tileSize, K, N, bM, threads,
+            printf("DEBUG computeWeightGradients: rank=%d block=%u expert=%u tileSize=%u K=%u N=%u bM=%u threads=%u act=%p grad=%p buffer=%p act[0]=%.6f grad[0]=%.6f buffer[0]=%.6f totalKN=%u elemsPerThread=%u\n",
+                   nvshmem_my_pe(), blockIdx.x, expertIdx, tileSize, K, N, bM, threads,
                    activations, gradients, weightGradBuffer,
                    static_cast<float>(activations[0]), static_cast<float>(gradients[0]),
                    static_cast<float>(weightGradBuffer[0]),
@@ -1471,13 +1481,13 @@ namespace flashmoe::processor{
 
 #if FLASHMOE_DEBUG
         if (!threadIdx.x && blockIdx.x < 2) {
-            printf("DEBUG computeWeightGradients EXIT: block=%u expert=%u buffer[0]=%.6f firstSum=%.6f startIdx=%u endIdx=%u\n",
-                   blockIdx.x, expertIdx, static_cast<float>(weightGradBuffer[0]),
+            printf("DEBUG computeWeightGradients EXIT: rank=%d block=%u expert=%u buffer[0]=%.6f firstSum=%.6f startIdx=%u endIdx=%u\n",
+                   nvshmem_my_pe(), blockIdx.x, expertIdx, static_cast<float>(weightGradBuffer[0]),
                    static_cast<float>(debugSum), startIdx, endIdx);
         }
         if (threadIdx.x == threads - 1 && blockIdx.x < 2) {
-            printf("DEBUG computeWeightGradients LAST_THREAD: block=%u thread=%u startIdx=%u endIdx=%u elemsComputed=%u\n",
-                   blockIdx.x, threadIdx.x, startIdx, endIdx, endIdx - startIdx);
+            printf("DEBUG computeWeightGradients LAST_THREAD: rank=%d block=%u thread=%u startIdx=%u endIdx=%u elemsComputed=%u\n",
+                   nvshmem_my_pe(), blockIdx.x, threadIdx.x, startIdx, endIdx, endIdx - startIdx);
         }
 #endif
     }
@@ -2130,20 +2140,20 @@ namespace flashmoe::processor{
                             // P2P: tNx gradCombine + 1 gradGateCombine = tNx+1 tasks per syncIdx
                             // Remote: tNx gradCombine + 1 gradGateCombine = tNx+1 tasks per syncIdx
                             const auto threshold = tNx + 1;
-#if FLASHMOE_DEBUG
-                            const auto priorCount = atomicAdd(pA.tQS + combineSyncIdx, 0U);
-                            printf("DEBUG gradGateCombine SYNC: block=%u syncIdx=%u combineSyncIdx=%u "
-                                   "priorCount=%u threshold=%u remote=%u localExpert=%u globalExpert=%u tile=%u\n",
-                                   blockIdx.x, rCurrentTask.syncIdx, combineSyncIdx,
-                                   priorCount, threshold, rCurrentTask.isPeerRemote, localExpertIdx, globalExpertIdx,
-                                   rCurrentTask.tileIdx);
-                            printf("DEBUG gradGateCombine METADATA: cData[0]=%p cData[1]=%p bData[0]=%p bData[1]=%p "
-                                   "dData[0]=%p dData[1]=%p M=%u tileSize=%u peerIdx=%u\n",
-                                   rCurrentTask.cData[0], rCurrentTask.cData[1],
-                                   rCurrentTask.bData[0], rCurrentTask.bData[1],
-                                   rCurrentTask.dData[0], rCurrentTask.dData[1],
-                                   rCurrentTask.M, rCurrentTask.tileSize, rCurrentTask.peerIdx);
-#endif
+// #if FLASHMOE_DEBUG
+//                             const auto priorCount = atomicAdd(pA.tQS + combineSyncIdx, 0U);
+//                             printf("DEBUG gradGateCombine SYNC: block=%u syncIdx=%u combineSyncIdx=%u "
+//                                    "priorCount=%u threshold=%u remote=%u localExpert=%u globalExpert=%u tile=%u\n",
+//                                    blockIdx.x, rCurrentTask.syncIdx, combineSyncIdx,
+//                                    priorCount, threshold, rCurrentTask.isPeerRemote, localExpertIdx, globalExpertIdx,
+//                                    rCurrentTask.tileIdx);
+//                             printf("DEBUG gradGateCombine METADATA: cData[0]=%p cData[1]=%p bData[0]=%p bData[1]=%p "
+//                                    "dData[0]=%p dData[1]=%p M=%u tileSize=%u peerIdx=%u\n",
+//                                    rCurrentTask.cData[0], rCurrentTask.cData[1],
+//                                    rCurrentTask.bData[0], rCurrentTask.bData[1],
+//                                    rCurrentTask.dData[0], rCurrentTask.dData[1],
+//                                    rCurrentTask.M, rCurrentTask.tileSize, rCurrentTask.peerIdx);
+// #endif
                             enqueue = atomicAdd(pA.tQS + combineSyncIdx, 1U) + 1 == threshold;
                         }
                         __syncthreads();
@@ -2433,13 +2443,13 @@ namespace flashmoe::processor{
                         __syncthreads();
                         if (!threadIdx.x) {
                             __threadfence();
-#if FLASHMOE_DEBUG
-                            const auto priorCount = atomicAdd(pA.tQS + rCurrentTask.syncIdx, 0U);
-                            printf("DEBUG gradPostGEMM SYNC: block=%u syncIdx=%u (combine used %u+gtQCl) "
-                                   "priorCount=%u tN=%u expert=%u tile=%u\n",
-                                   blockIdx.x, rCurrentTask.syncIdx, rCurrentTask.syncIdx,
-                                   priorCount, tN, rCurrentTask.expertIdx, rCurrentTask.tileIdx);
-#endif
+// #if FLASHMOE_DEBUG
+//                             const auto priorCount = atomicAdd(pA.tQS + rCurrentTask.syncIdx, 0U);
+//                             printf("DEBUG gradPostGEMM SYNC: block=%u syncIdx=%u (combine used %u+gtQCl) "
+//                                    "priorCount=%u tN=%u expert=%u tile=%u\n",
+//                                    blockIdx.x, rCurrentTask.syncIdx, rCurrentTask.syncIdx,
+//                                    priorCount, tN, rCurrentTask.expertIdx, rCurrentTask.tileIdx);
+// #endif
                             enqueue = atomicAdd(pA.tQS + rCurrentTask.syncIdx, 1U) + 1 == tN;
 #if FLASHMOE_DEBUG
                             if (enqueue && blockIdx.x < 3) {

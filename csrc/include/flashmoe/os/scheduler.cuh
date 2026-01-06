@@ -65,7 +65,7 @@ namespace flashmoe::scheduler {
         unsigned int processors,
         unsigned int sL = (THREADS - WARP_SIZE) / WARP_SIZE,
         unsigned int wS = WARP_SIZE,
-        unsigned int blockQStride = ACC::TNx::value,
+        unsigned int blockQStride = ACC::TN::value + ACC::TNx::value,
         typename WarpScan = cub::WarpScan<uint>,
         typename SQState,
         typename TQState,
