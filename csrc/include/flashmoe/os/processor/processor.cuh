@@ -309,6 +309,43 @@ namespace flashmoe::processor{
         }
         __syncthreads();
 
+#if FLASHMOE_DEBUG
+        // Debug: Find max tokenIdx and check for OOB (tokenIdx >= S)
+        {
+            __shared__ unsigned int sMaxTokenIdx;
+            __shared__ unsigned int sOOBCount;
+            if (!threadIdx.x) {
+                sMaxTokenIdx = 0;
+                sOOBCount = 0;
+            }
+            __syncthreads();
+
+            if (threadIdx.x < tileSize) {
+                const auto myTokenIdx = sTPS[threadIdx.x].tokenIdx;
+                atomicMax(&sMaxTokenIdx, myTokenIdx);
+                if (myTokenIdx >= M) {
+                    atomicAdd(&sOOBCount, 1U);
+                }
+            }
+            __syncthreads();
+
+            if (!threadIdx.x) {
+                if (sMaxTokenIdx >= M || sOOBCount > 0) {
+                    printf("ERROR splitGradients OOB: rank=%d block=%u tileIdx=%u tileSize=%u expert=%u "
+                           "maxTokenIdx=%u >= S=%u oobCount=%u\n",
+                           nvshmem_my_pe(), blockIdx.x, tileIdx, tileSize, expertIdx,
+                           sMaxTokenIdx, M, sOOBCount);
+                    printf("ERROR splitGradients PTRS: aData(tokenIndices)=%p gradOutput=%p expertGradients=%p\n",
+                           tokenIndices, gradOutput, expertGradients);
+                    printf("ERROR splitGradients tokenIdx[0..7]=[%u,%u,%u,%u,%u,%u,%u,%u]\n",
+                           sTPS[0].tokenIdx, sTPS[1].tokenIdx, sTPS[2].tokenIdx, sTPS[3].tokenIdx,
+                           sTPS[4].tokenIdx, sTPS[5].tokenIdx, sTPS[6].tokenIdx, sTPS[7].tokenIdx);
+                }
+            }
+            __syncthreads();
+        }
+#endif
+
         if constexpr (c == CombineMode::multithreaded) {
             TPS wT[wE];
             Element rS[wE];
@@ -1144,6 +1181,39 @@ namespace flashmoe::processor{
         const auto offset = ACC::TNx::value * rCurrentTask.batchIdx;
         const auto ptQOffset = rCurrentTask.syncIdx * ACC::TNx::value;
         auto* __restrict__ tQ = CAST_TO(uint, pA.ptQ + ptQOffset);
+
+        // Bounds checks for ptQ secondary queue overflow
+        {
+            const auto gtQCl = bookkeeping.gtQCl;
+            const auto ptQCapacity = gtQCl * ptQSlotSize;
+            // Check syncIdx is within gtQCl (gradient task queue capacity limit)
+            if (!threadIdx.x && rCurrentTask.syncIdx >= gtQCl) {
+                printf("ERROR notifyGradientImpl syncIdx OOB: rank=%u block=%u TaskT=%u "
+                       "syncIdx=%u >= gtQCl=%u expert=%u batchIdx=%u\n",
+                       nvshmem_my_pe(), blockIdx.x, static_cast<unsigned>(TaskT),
+                       rCurrentTask.syncIdx, gtQCl, rCurrentTask.expertIdx, rCurrentTask.batchIdx);
+            }
+            // Check ptQOffset won't exceed ptQ capacity
+            if (!threadIdx.x && ptQOffset >= ptQCapacity) {
+                printf("ERROR notifyGradientImpl ptQOffset OOB: rank=%u block=%u TaskT=%u "
+                       "ptQOffset=%u >= ptQCapacity=%u syncIdx=%u gtQCl=%u\n",
+                       nvshmem_my_pe(), blockIdx.x, static_cast<unsigned>(TaskT),
+                       ptQOffset, ptQCapacity, rCurrentTask.syncIdx, gtQCl);
+            }
+            // Check ptQOffset + tasks won't exceed ptQ capacity (last task index)
+            if (!threadIdx.x && (ptQOffset + tasks) > ptQCapacity) {
+                printf("ERROR notifyGradientImpl ptQ end OOB: rank=%u block=%u TaskT=%u "
+                       "ptQOffset=%u tasks=%u end=%u > ptQCapacity=%u syncIdx=%u\n",
+                       nvshmem_my_pe(), blockIdx.x, static_cast<unsigned>(TaskT),
+                       ptQOffset, tasks, ptQOffset + tasks, ptQCapacity, rCurrentTask.syncIdx);
+            }
+            // Check ptQ base pointer is not null
+            if (!threadIdx.x && pA.ptQ == nullptr) {
+                printf("ERROR notifyGradientImpl ptQ NULL: rank=%u block=%u TaskT=%u syncIdx=%u\n",
+                       nvshmem_my_pe(), blockIdx.x, static_cast<unsigned>(TaskT), rCurrentTask.syncIdx);
+            }
+        }
+
 #if FLASHMOE_DEBUG
         if (!threadIdx.x && blockIdx.x < 2) {
             printf("DEBUG notifyGradientImpl ENTER: block=%u TaskT=%u tasks=%u batchIdx=%u syncIdx=%u "
@@ -1693,16 +1763,53 @@ namespace flashmoe::processor{
                     break;
                     case TaskType::gradCombine: {
                         constexpr unsigned int gradIndex = 0;
+                        // Bounds check: tileIdx must be < tNx to avoid OOB in splitGradients
+                        if (rCurrentTask.tileIdx >= tNx) {
+                            if (!threadIdx.x) {
+                                printf("ERROR gradCombine OOB: rank=%u block=%u tileIdx=%u >= tNx=%u expert=%u syncIdx=%u\n",
+                                       nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx, tNx,
+                                       rCurrentTask.expertIdx, rCurrentTask.syncIdx);
+                            }
+                        }
 // #if FLASHMOE_DEBUG
 //                         if (!threadIdx.x) {
-//                             printf("DEBUG gradCombine ENTER: block=%u tile=%u tileSize=%u expert=%u\n",
-//                                    blockIdx.x, rCurrentTask.tileIdx, rCurrentTask.tileSize, rCurrentTask.expertIdx);
-//                             printf("DEBUG gradCombine PTRS: gradOutputBasePtr=%p aData=%p cData=%p\n",
+//                             const auto* tps = CONST_CAST_TO(TPS, rCurrentTask.aData);
+//                             // Check TPS alignment (should be 8-byte aligned for TPS struct)
+//                             const bool tpsAligned = (reinterpret_cast<uintptr_t>(tps) % alignof(TPS)) == 0;
+//                             // Print first few tokenIdx values
+//                             printf("DEBUG gradCombine ENTER: rank=%d block=%u tile=%u tileSize=%u expert=%u\n",
+//                                    nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx, rCurrentTask.tileSize, rCurrentTask.expertIdx);
+//                             printf("DEBUG gradCombine PTRS: gradOutputBasePtr=%p aData=%p cData=%p tpsAligned=%d\n",
 //                                    flashmoe::moe::gradOutputBasePtr,
 //                                    rCurrentTask.aData,
-//                                    rCurrentTask.cData[gradIndex]);
+//                                    rCurrentTask.cData[gradIndex],
+//                                    static_cast<int>(tpsAligned));
+//                             printf("DEBUG gradCombine tokenIdx[0..7]=[%u,%u,%u,%u,%u,%u,%u,%u]\n",
+//                                    tps[0].tokenIdx, tps[1].tokenIdx, tps[2].tokenIdx, tps[3].tokenIdx,
+//                                    tps[4].tokenIdx, tps[5].tokenIdx, tps[6].tokenIdx, tps[7].tokenIdx);
+//                             // Validate cData[0] is within expected range for this expert
+//                             // cData should point to expertGradients buffer: BLOCK_M * H * sizeof(Element) per expert
+//                             constexpr auto expertGradSize = BLOCK_M * ACC::H::value;
+//                             const auto* expertGradBase = CONST_CAST_TO(Element, bookkeeping.gradGateCombine);
+//                             const auto* cDataPtr = CONST_CAST_TO(Element, rCurrentTask.cData[gradIndex]);
+//                             const auto offsetFromBase = cDataPtr - expertGradBase;
+//                             printf("DEBUG gradCombine VALIDATE: cData offset from gradGateCombine=%ld expertGradSize=%u\n",
+//                                    static_cast<long>(offsetFromBase), expertGradSize);
 //                         }
 // #endif
+                        // TPS range check before splitGradients
+                        {
+                            auto* tPBase = bookkeeping.tP();
+                            auto* tPEnd  = tPBase + ACC::E::value * ACC::pEC::value;
+                            const auto* rowTokenIndices = CONST_CAST_TO(TPS, rCurrentTask.aData);
+                            if (!threadIdx.x && (reinterpret_cast<const cuda::std::byte*>(rowTokenIndices) < reinterpret_cast<const cuda::std::byte*>(tPBase) ||
+                                            reinterpret_cast<const cuda::std::byte*>(rowTokenIndices + rCurrentTask.tileSize) > reinterpret_cast<const cuda::std::byte*>(tPEnd))) {
+                                printf("ERROR TPS OOB gradCombine: expert=%u tileSize=%u "
+                                       "rowPtr=%p tPBase=%p tPEnd=%p\n",
+                                       rCurrentTask.expertIdx, rCurrentTask.tileSize,
+                                       rowTokenIndices, tPBase, tPEnd);
+                            }
+                        }
                         // Use global gradOutputBasePtr instead of bData[0] (which is packet, not full buffer)
                         splitGradients<ACC::CM::value>(
                             workspace,
@@ -1743,6 +1850,12 @@ namespace flashmoe::processor{
 //                                    blockIdx.x, rCurrentTask.syncIdx, combineSyncIdx, bookkeeping.gtQCl,
 //                                    priorCount, threshold, rCurrentTask.isPeerRemote, rCurrentTask.expertIdx,
 //                                    rCurrentTask.tileIdx);
+//                             printf("DEBUG gradCombine METADATA: cData[0]=%p cData[1]=%p bData[0]=%p bData[1]=%p "
+//                                    "dData[0]=%p dData[1]=%p M=%u tileSize=%u peerIdx=%u\n",
+//                                    rCurrentTask.cData[0], rCurrentTask.cData[1],
+//                                    rCurrentTask.bData[0], rCurrentTask.bData[1],
+//                                    rCurrentTask.dData[0], rCurrentTask.dData[1],
+//                                    rCurrentTask.M, rCurrentTask.tileSize, rCurrentTask.peerIdx);
 // #endif
                             enqueue = atomicAdd(pA.tQS + combineSyncIdx, 1U) + 1 == threshold;
                         }
@@ -1835,10 +1948,11 @@ namespace flashmoe::processor{
 #if FLASHMOE_DEBUG
                         if (!threadIdx.x && blockIdx.x < 2) {
                             printf("DEBUG gradGateCombine ENTER: rank=%u block=%u tile=%u tileSize=%u S=%u E=%u H=%u expert=%u "
-                                   "gradOut=%p gateBuffer=%p tokenIds=%p z2RowBase=%p xMOffset=%lld baseRowIdx=%lld\n",
+                                   "gradOut=%p gateBuffer=%p tokenIds=%p z2RowBase=%p xMOffset=%lld baseRowIdx=%lld cData[1]=%p\n",
                                       nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx, tileSize, S, E, H, rCurrentTask.expertIdx,
                                    gradOut, gateBuffer, tokenIds, z2RowBase,
-                                   static_cast<long long>(xMOffset), static_cast<long long>(baseRowIdx));
+                                   static_cast<long long>(xMOffset), static_cast<long long>(baseRowIdx),
+                                   rCurrentTask.cData[1]);
                         }
 #endif
                         // No per-tile zeroing needed - gateBuffer is pre-zeroed in bootstrap
@@ -1910,14 +2024,20 @@ namespace flashmoe::processor{
                             // P2P: tNx gradCombine + 1 gradGateCombine = tNx+1 tasks per syncIdx
                             // Remote: tNx gradCombine + 1 gradGateCombine = tNx+1 tasks per syncIdx
                             const auto threshold = tNx + 1;
-// #if FLASHMOE_DEBUG
-//                             const auto priorCount = atomicAdd(pA.tQS + combineSyncIdx, 0U);
-//                             printf("DEBUG gradGateCombine SYNC: block=%u syncIdx=%u combineSyncIdx=%u "
-//                                    "priorCount=%u threshold=%u remote=%u expert=%u tile=%u\n",
-//                                    blockIdx.x, rCurrentTask.syncIdx, combineSyncIdx,
-//                                    priorCount, threshold, rCurrentTask.isPeerRemote, rCurrentTask.expertIdx,
-//                                    rCurrentTask.tileIdx);
-// #endif
+#if FLASHMOE_DEBUG
+                            const auto priorCount = atomicAdd(pA.tQS + combineSyncIdx, 0U);
+                            printf("DEBUG gradGateCombine SYNC: block=%u syncIdx=%u combineSyncIdx=%u "
+                                   "priorCount=%u threshold=%u remote=%u expert=%u tile=%u\n",
+                                   blockIdx.x, rCurrentTask.syncIdx, combineSyncIdx,
+                                   priorCount, threshold, rCurrentTask.isPeerRemote, rCurrentTask.expertIdx,
+                                   rCurrentTask.tileIdx);
+                            printf("DEBUG gradGateCombine METADATA: cData[0]=%p cData[1]=%p bData[0]=%p bData[1]=%p "
+                                   "dData[0]=%p dData[1]=%p M=%u tileSize=%u peerIdx=%u\n",
+                                   rCurrentTask.cData[0], rCurrentTask.cData[1],
+                                   rCurrentTask.bData[0], rCurrentTask.bData[1],
+                                   rCurrentTask.dData[0], rCurrentTask.dData[1],
+                                   rCurrentTask.M, rCurrentTask.tileSize, rCurrentTask.peerIdx);
+#endif
                             enqueue = atomicAdd(pA.tQS + combineSyncIdx, 1U) + 1 == threshold;
                         }
                         __syncthreads();
@@ -2066,6 +2186,15 @@ namespace flashmoe::processor{
                                    nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx, rCurrentTask.aData);
                         }
 #endif
+                        // Bounds check: tileIdx must be < tN to avoid OOB
+                        if (rCurrentTask.tileIdx >= tN) {
+                            if (!threadIdx.x) {
+                                printf("ERROR gradPostGEMM OOB: rank=%u block=%u tileIdx=%u >= tN=%u expert=%u syncIdx=%u\n",
+                                       nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx, tN,
+                                       rCurrentTask.expertIdx, rCurrentTask.syncIdx);
+                            }
+                            break;
+                        }
                         constexpr unsigned int w2Index = 1;
                         constexpr unsigned int w1Index = 0;
                         const Element* z2Activation = nullptr;
@@ -2076,6 +2205,46 @@ namespace flashmoe::processor{
                         const auto rowIdx2 = xMOffset2 / P;
                         z2Activation = bookkeeping.z2() + rowIdx2 * H;
                         a1Activation = xMPtr;
+                        // Bounds checks for cData pointers and derived z2Activation
+                        {
+                            const auto xMTotalRows = bookkeeping.world * bookkeeping.nLx * ACC::pEC::value;
+                            auto* z2Base = bookkeeping.z2();
+                            auto* z2End = z2Base + xMTotalRows * H;
+                            auto* xMEnd = xMBase + xMTotalRows * P;
+                            // Check cData[1] (xM row) is within xM buffer
+                            if (!threadIdx.x && (xMPtr < xMBase || xMPtr >= xMEnd)) {
+                                printf("ERROR gradPostGEMM cData[1] OOB: rank=%u block=%u tile=%u "
+                                       "cData[1]=%p xMBase=%p xMEnd=%p expert=%u\n",
+                                       nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx,
+                                       xMPtr, xMBase, xMEnd, rCurrentTask.expertIdx);
+                            }
+                            // Check cData[0] (packet row) is not null
+                            if (!threadIdx.x && rCurrentTask.cData[w1Index] == nullptr) {
+                                printf("ERROR gradPostGEMM cData[0] NULL: rank=%u block=%u tile=%u expert=%u\n",
+                                       nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx, rCurrentTask.expertIdx);
+                            }
+                            // Check z2Activation is within z2 buffer
+                            if (!threadIdx.x && (z2Activation < z2Base || z2Activation >= z2End)) {
+                                printf("ERROR gradPostGEMM z2Activation OOB: rank=%u block=%u tile=%u "
+                                       "z2Act=%p z2Base=%p z2End=%p rowIdx=%lld expert=%u\n",
+                                       nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx,
+                                       z2Activation, z2Base, z2End, rowIdx2, rCurrentTask.expertIdx);
+                            }
+                            // Check rowIdx2 is non-negative
+                            if (!threadIdx.x && rowIdx2 < 0) {
+                                printf("ERROR gradPostGEMM rowIdx2 negative: rank=%u block=%u tile=%u "
+                                       "rowIdx=%lld xMOffset=%lld expert=%u\n",
+                                       nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx,
+                                       rowIdx2, xMOffset2, rCurrentTask.expertIdx);
+                            }
+                            // Check dData (savedZ2) pointers are valid (propagated from gradCombine)
+                            if (!threadIdx.x && (rCurrentTask.dData[0] == nullptr || rCurrentTask.dData[1] == nullptr)) {
+                                printf("ERROR gradPostGEMM dData NULL: rank=%u block=%u tile=%u "
+                                       "dData[0]=%p dData[1]=%p expert=%u\n",
+                                       nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx,
+                                       rCurrentTask.dData[0], rCurrentTask.dData[1], rCurrentTask.expertIdx);
+                            }
+                        }
 #if FLASHMOE_DEBUG
                         if (!threadIdx.x && blockIdx.x < 3) {
                             auto* z2Base = bookkeeping.z2();
@@ -2109,13 +2278,13 @@ namespace flashmoe::processor{
                         __syncthreads();
                         if (!threadIdx.x) {
                             __threadfence();
-// #if FLASHMOE_DEBUG
-//                             const auto priorCount = atomicAdd(pA.tQS + rCurrentTask.syncIdx, 0U);
-//                             printf("DEBUG gradPostGEMM SYNC: block=%u syncIdx=%u (combine used %u+gtQCl) "
-//                                    "priorCount=%u tN=%u expert=%u tile=%u\n",
-//                                    blockIdx.x, rCurrentTask.syncIdx, rCurrentTask.syncIdx,
-//                                    priorCount, tN, rCurrentTask.expertIdx, rCurrentTask.tileIdx);
-// #endif
+#if FLASHMOE_DEBUG
+                            const auto priorCount = atomicAdd(pA.tQS + rCurrentTask.syncIdx, 0U);
+                            printf("DEBUG gradPostGEMM SYNC: block=%u syncIdx=%u (combine used %u+gtQCl) "
+                                   "priorCount=%u tN=%u expert=%u tile=%u\n",
+                                   blockIdx.x, rCurrentTask.syncIdx, rCurrentTask.syncIdx,
+                                   priorCount, tN, rCurrentTask.expertIdx, rCurrentTask.tileIdx);
+#endif
                             enqueue = atomicAdd(pA.tQS + rCurrentTask.syncIdx, 1U) + 1 == tN;
 #if FLASHMOE_DEBUG
                             if (enqueue && blockIdx.x < 3) {
@@ -2142,16 +2311,67 @@ namespace flashmoe::processor{
                     }
                     break;
                     case TaskType::gradPreGEMM: {
+                        // Bounds check: tileIdx must be < tNx to avoid OOB
+                        // gradPreGEMM output is [M, H], so column tiles = TNx = ceil(H/BLOCK_N)
+                        if (rCurrentTask.tileIdx >= tNx) {
+                            if (!threadIdx.x) {
+                                printf("ERROR gradPreGEMM OOB: rank=%u block=%u tileIdx=%u >= tNx=%u expert=%u syncIdx=%u\n",
+                                       nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx, tNx,
+                                       rCurrentTask.expertIdx, rCurrentTask.syncIdx);
+                            }
+                            break;
+                        }
                         constexpr unsigned int w1Index = 0;
                         // Compute z1 offset for saved activation (same layout as forward preGEMM)
                         // z1 was stored at same offset as cData[0] relative to xM base
                         const Element* z1Activation = nullptr;
                         long long xMOffset = 0;
+                        auto* xMBase = CAST_TO(Element, bookkeeping.xM());
                         {
-                            auto* xMBase = CAST_TO(Element, bookkeeping.xM());
                             auto* cDataPtr = CAST_TO(Element, rCurrentTask.cData[w1Index]);
                             xMOffset = cDataPtr - xMBase;
                             z1Activation = bookkeeping.z1() + xMOffset;
+                        }
+                        // Bounds checks for aData, z1Activation, cData, and dData
+                        {
+                            const auto xMTotalSize = bookkeeping.world * bookkeeping.nLx * ACC::pEC::value * P;
+                            auto* z1Base = bookkeeping.z1();
+                            auto* z1End = z1Base + xMTotalSize;
+                            auto* xMEnd = xMBase + xMTotalSize;
+                            auto* cDataPtr = CAST_TO(Element, rCurrentTask.cData[w1Index]);
+                            // Check xMOffset is non-negative
+                            if (!threadIdx.x && xMOffset < 0) {
+                                printf("ERROR gradPreGEMM xMOffset negative: rank=%u block=%u tile=%u "
+                                       "xMOffset=%lld cData=%p xMBase=%p expert=%u\n",
+                                       nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx,
+                                       xMOffset, cDataPtr, xMBase, rCurrentTask.expertIdx);
+                            }
+                            // Check cData[0] is within xM buffer
+                            if (!threadIdx.x && (cDataPtr < xMBase || cDataPtr >= xMEnd)) {
+                                printf("ERROR gradPreGEMM cData[0] OOB: rank=%u block=%u tile=%u "
+                                       "cData=%p xMBase=%p xMEnd=%p expert=%u\n",
+                                       nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx,
+                                       cDataPtr, xMBase, xMEnd, rCurrentTask.expertIdx);
+                            }
+                            // Check z1Activation is within z1 buffer
+                            if (!threadIdx.x && (z1Activation < z1Base || z1Activation >= z1End)) {
+                                printf("ERROR gradPreGEMM z1Activation OOB: rank=%u block=%u tile=%u "
+                                       "z1Act=%p z1Base=%p z1End=%p xMOffset=%lld expert=%u\n",
+                                       nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx,
+                                       z1Activation, z1Base, z1End, xMOffset, rCurrentTask.expertIdx);
+                            }
+                            // Check aData (grad_a1 from gradPostGEMM) is not null
+                            if (!threadIdx.x && rCurrentTask.aData == nullptr) {
+                                printf("ERROR gradPreGEMM aData NULL: rank=%u block=%u tile=%u expert=%u\n",
+                                       nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx, rCurrentTask.expertIdx);
+                            }
+                            // Check dData (savedZ1) pointers are valid
+                            if (!threadIdx.x && (rCurrentTask.dData[0] == nullptr || rCurrentTask.dData[1] == nullptr)) {
+                                printf("ERROR gradPreGEMM dData NULL: rank=%u block=%u tile=%u "
+                                       "dData[0]=%p dData[1]=%p expert=%u\n",
+                                       nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx,
+                                       rCurrentTask.dData[0], rCurrentTask.dData[1], rCurrentTask.expertIdx);
+                            }
                         }
 #if FLASHMOE_DEBUG
                         if (!threadIdx.x && blockIdx.x < 3) {
@@ -2183,6 +2403,53 @@ namespace flashmoe::processor{
 
                             constexpr auto expertStride = 2 * P * H + P + H;
                             auto* const weightGradBuffer = CAST_TO(Element, bookkeeping.gW()) + localExpertIdx * expertStride;
+
+                            // Bounds checks for originalInput heap pointer and computeWeightGradients inputs
+                            {
+                                // Check originalInput (heap pointer) is not null
+                                if (!threadIdx.x && heapPtr == nullptr) {
+                                    printf("ERROR gradPreGEMM heapPtr NULL: rank=%u block=%u tile=%u "
+                                           "peer=%u expert=%u batchIdx=%u tokenOffset=%u\n",
+                                           nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx,
+                                           peer, localExpertIdx, rCurrentTask.batchIdx, tokenOffset);
+                                }
+                                // Check peer index is within world size
+                                if (!threadIdx.x && peer >= bookkeeping.world) {
+                                    printf("ERROR gradPreGEMM peer OOB: rank=%u block=%u tile=%u "
+                                           "peer=%u >= world=%u expert=%u\n",
+                                           nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx,
+                                           peer, bookkeeping.world, localExpertIdx);
+                                }
+                                // Check localExpertIdx is within nLx
+                                if (!threadIdx.x && localExpertIdx >= bookkeeping.nLx) {
+                                    printf("ERROR gradPreGEMM expertIdx OOB: rank=%u block=%u tile=%u "
+                                           "expert=%u >= nLx=%u peer=%u\n",
+                                           nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx,
+                                           localExpertIdx, bookkeeping.nLx, peer);
+                                }
+                                // Check tileSize is valid (> 0 and <= BLOCK_M)
+                                if (!threadIdx.x && (rCurrentTask.tileSize == 0 || rCurrentTask.tileSize > BLOCK_M)) {
+                                    printf("ERROR gradPreGEMM tileSize invalid: rank=%u block=%u tile=%u "
+                                           "tileSize=%u BLOCK_M=%u expert=%u\n",
+                                           nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx,
+                                           rCurrentTask.tileSize, BLOCK_M, localExpertIdx);
+                                }
+                                // Check batchIdx won't cause tokenOffset overflow
+                                const auto maxTokens = ACC::pEC::value;
+                                if (!threadIdx.x && tokenOffset >= maxTokens) {
+                                    printf("ERROR gradPreGEMM tokenOffset OOB: rank=%u block=%u tile=%u "
+                                           "tokenOffset=%u >= pEC=%u batchIdx=%u expert=%u\n",
+                                           nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx,
+                                           tokenOffset, maxTokens, rCurrentTask.batchIdx, localExpertIdx);
+                                }
+                                // Check weightGradBuffer is not null
+                                if (!threadIdx.x && weightGradBuffer == nullptr) {
+                                    printf("ERROR gradPreGEMM weightGradBuffer NULL: rank=%u block=%u tile=%u "
+                                           "gW=%p expert=%u stride=%u\n",
+                                           nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx,
+                                           bookkeeping.gW(), localExpertIdx, expertStride);
+                                }
+                            }
 
                             if (!threadIdx.x && blockIdx.x < 3) {
                                 printf("DEBUG gradWeights: rank=%d block=%u peer=%u expert=%u batchIdx=%u tileSize=%u tokenOff=%u stride=%u heap=%p orig=%p aData=%p buf=%p\n",
@@ -2263,6 +2530,7 @@ namespace flashmoe::processor{
                         // accumulate grad_input from expert computation back to token positions
                         // no probability scaling needed - gradCombine already applied it
                         constexpr auto H = ACC::H::value;
+                        constexpr auto S = ACC::S::value;
                         constexpr auto threads = ACC::PeakHardware::OS::threads::value;
 
                         const auto tileSize = rCurrentTask.tileSize;
@@ -2276,6 +2544,41 @@ namespace flashmoe::processor{
                         // Destination: global gradInputBasePtr
                         auto* __restrict__ gradInputDst = flashmoe::moe::gradInputBasePtr;
 
+                        // Bounds checks for tokenIds, gradInputSrc, and tileSize
+                        {
+                            // Check tokenIds (aData) is within tP bounds
+                            auto* tPBase = bookkeeping.tP();
+                            auto* tPEnd = tPBase + ACC::E::value * ACC::pEC::value;
+                            if (!threadIdx.x && (tokenIds < tPBase ||
+                                reinterpret_cast<const cuda::std::byte*>(tokenIds + tileSize) >
+                                reinterpret_cast<const cuda::std::byte*>(tPEnd))) {
+                                printf("ERROR gradInputCombine tokenIds OOB: rank=%u block=%u tile=%u "
+                                       "tokenIds=%p tileSize=%u tPBase=%p tPEnd=%p expert=%u\n",
+                                       nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx,
+                                       tokenIds, tileSize, tPBase, tPEnd, rCurrentTask.expertIdx);
+                            }
+                            // Check gradInputSrc is not null
+                            if (!threadIdx.x && gradInputSrc == nullptr) {
+                                printf("ERROR gradInputCombine gradInputSrc NULL: rank=%u block=%u tile=%u "
+                                       "isPeerRemote=%u cData[0]=%p cData[1]=%p expert=%u\n",
+                                       nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx,
+                                       static_cast<unsigned>(rCurrentTask.isPeerRemote),
+                                       rCurrentTask.cData[0], rCurrentTask.cData[1], rCurrentTask.expertIdx);
+                            }
+                            // Check gradInputDst is not null
+                            if (!threadIdx.x && gradInputDst == nullptr) {
+                                printf("ERROR gradInputCombine gradInputDst NULL: rank=%u block=%u tile=%u expert=%u\n",
+                                       nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx, rCurrentTask.expertIdx);
+                            }
+                            // Check tileSize is valid
+                            if (!threadIdx.x && (tileSize == 0 || tileSize > BLOCK_M)) {
+                                printf("ERROR gradInputCombine tileSize invalid: rank=%u block=%u tile=%u "
+                                       "tileSize=%u BLOCK_M=%u expert=%u\n",
+                                       nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx,
+                                       tileSize, BLOCK_M, rCurrentTask.expertIdx);
+                            }
+                        }
+
                         using NativeElement = typename ToCDx<Element>::T;
                         constexpr auto convertNative = cutlass::NumericConverter<NativeElement, Element>{};
 
@@ -2285,6 +2588,32 @@ namespace flashmoe::processor{
                             sTPS[threadIdx.x] = tokenIds[threadIdx.x];
                         }
                         __syncthreads();
+
+                        // Validate tokenIdx < S before scatter (check in shared memory after load)
+                        {
+                            __shared__ unsigned int sMaxTokenIdx;
+                            __shared__ unsigned int sOOBCount;
+                            if (!threadIdx.x) {
+                                sMaxTokenIdx = 0;
+                                sOOBCount = 0;
+                            }
+                            __syncthreads();
+                            // Each thread checks its assigned tokens
+                            if (threadIdx.x < tileSize) {
+                                const auto myTokenIdx = sTPS[threadIdx.x].tokenIdx;
+                                atomicMax(&sMaxTokenIdx, myTokenIdx);
+                                if (myTokenIdx >= S) {
+                                    atomicAdd(&sOOBCount, 1U);
+                                }
+                            }
+                            __syncthreads();
+                            if (!threadIdx.x && (sMaxTokenIdx >= S || sOOBCount > 0)) {
+                                printf("ERROR gradInputCombine tokenIdx OOB: rank=%u block=%u tile=%u tileSize=%u "
+                                       "maxTokenIdx=%u >= S=%u oobCount=%u expert=%u\n",
+                                       nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx, tileSize,
+                                       sMaxTokenIdx, S, sOOBCount, rCurrentTask.expertIdx);
+                            }
+                        }
 
                         // Parallel scatter-accumulate
                         for (uint t = 0; t < tileSize; ++t) {

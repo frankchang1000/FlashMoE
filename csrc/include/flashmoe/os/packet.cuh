@@ -552,6 +552,12 @@ namespace flashmoe::packet {
             if (routedTokens == 0) return;
             if (laneId != 0) return;
 
+            if (!laneId && (routedTokens > ACC::pEC::value ||
+                            cute::ceil_div(routedTokens, BLOCK_M) > ACC::TCM::value)) {
+                printf("ERROR routedTokens overflow: expert=%u routed=%u pEC=%u TCM=%u\n",
+                       globalExpertIdx, routedTokens, ACC::pEC::value, ACC::TCM::value);
+            }
+
             const auto fTilesM = routedTokens / BLOCK_M;
             const auto residue = routedTokens - fTilesM * BLOCK_M;
             const auto totalRowTiles = fTilesM + (residue > 0 ? 1 : 0);
@@ -666,6 +672,12 @@ namespace flashmoe::packet {
 
             if (routedTokens == 0) return;
             if (laneId != 0) return;
+
+            if (!laneId && (routedTokens > ACC::pEC::value ||
+                            cute::ceil_div(routedTokens, BLOCK_M) > ACC::TCM::value)) {
+                printf("ERROR routedTokens overflow: expert=%u routed=%u pEC=%u TCM=%u\n",
+                       globalExpertIdx, routedTokens, ACC::pEC::value, ACC::TCM::value);
+            }
 
             const auto fTilesM = routedTokens / BLOCK_M;
             const auto residue = routedTokens - fTilesM * BLOCK_M;
