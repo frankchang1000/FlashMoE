@@ -1901,7 +1901,9 @@ namespace flashmoe::processor{
                                        tNx + 1, rCurrentTask.syncIdx);
 #endif
                             }
-                            //   - cData[0] = xMLocation (split gradient output buffer)
+                            // Task cData layout from decoder:
+                            //   - cData[0] = rowPacket (grad_output split destination, gradPreGEMM output)
+                            //   - cData[1] = rowXM (xM row pointer for z1/z2 offset derivation)
                             //   - bData = [W1, W2] weights
                             //   - dData = [z1, z2] saved activations
 #if FLASHMOE_DEBUG
@@ -2159,7 +2161,9 @@ namespace flashmoe::processor{
                                        tNx + 1, rCurrentTask.syncIdx);
                             }
 #endif
-                            //   - cData[0] = xMLocation (split gradient output buffer)
+                            // Task cData layout from decoder:
+                            //   - cData[0] = rowPacket (grad_output split destination, gradPreGEMM output)
+                            //   - cData[1] = rowXM (xM row pointer for z1/z2 offset derivation)
                             //   - bData = [W1, W2] weights
                             //   - dData = [z1, z2] saved activations
                             if (!rCurrentTask.isPeerRemote) {
@@ -2472,15 +2476,17 @@ namespace flashmoe::processor{
                             }
                             break;
                         }
-                        constexpr unsigned int w1Index = 0;
+                        constexpr unsigned int w1Index = 0;   // Output destination (packet buffer)
+                        constexpr unsigned int xMIndex = 1;   // xM row pointer (same as w2Index in gradPostGEMM)
                         // Compute z1 offset for saved activation (same layout as forward preGEMM)
-                        // z1 was stored at same offset as cData[0] relative to xM base
+                        // z1 was stored at same offset as cData[1] (xM row pointer) relative to xM base
+                        // Note: cData[0] is packet (output dest), cData[1] is xM (for offset calculation)
                         const Element* z1Activation = nullptr;
                         long long xMOffset = 0;
                         auto* xMBase = CAST_TO(Element, bookkeeping.xM());
                         {
-                            auto* cDataPtr = CAST_TO(Element, rCurrentTask.cData[w1Index]);
-                            xMOffset = cDataPtr - xMBase;
+                            auto* xMPtr = CAST_TO(Element, rCurrentTask.cData[xMIndex]);
+                            xMOffset = xMPtr - xMBase;
                             z1Activation = bookkeeping.z1() + xMOffset;
                         }
                         // Bounds checks for aData, z1Activation, cData, and dData
@@ -2489,20 +2495,20 @@ namespace flashmoe::processor{
                             auto* z1Base = bookkeeping.z1();
                             auto* z1End = z1Base + xMTotalSize;
                             auto* xMEnd = xMBase + xMTotalSize;
-                            auto* cDataPtr = CAST_TO(Element, rCurrentTask.cData[w1Index]);
+                            auto* xMDataPtr = CAST_TO(Element, rCurrentTask.cData[xMIndex]);
                             // Check xMOffset is non-negative
                             if (!threadIdx.x && xMOffset < 0) {
                                 printf("ERROR gradPreGEMM xMOffset negative: rank=%u block=%u tile=%u "
-                                       "xMOffset=%lld cData=%p xMBase=%p expert=%u\n",
+                                       "xMOffset=%lld cData[1]=%p xMBase=%p expert=%u\n",
                                        nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx,
-                                       xMOffset, cDataPtr, xMBase, rCurrentTask.expertIdx);
+                                       xMOffset, xMDataPtr, xMBase, rCurrentTask.expertIdx);
                             }
-                            // Check cData[0] is within xM buffer
-                            if (!threadIdx.x && (cDataPtr < xMBase || cDataPtr >= xMEnd)) {
-                                printf("ERROR gradPreGEMM cData[0] OOB: rank=%u block=%u tile=%u "
-                                       "cData=%p xMBase=%p xMEnd=%p expert=%u\n",
+                            // Check cData[1] (xM pointer) is within xM buffer
+                            if (!threadIdx.x && (xMDataPtr < xMBase || xMDataPtr >= xMEnd)) {
+                                printf("ERROR gradPreGEMM cData[1] OOB: rank=%u block=%u tile=%u "
+                                       "cData[1]=%p xMBase=%p xMEnd=%p expert=%u\n",
                                        nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx,
-                                       cDataPtr, xMBase, xMEnd, rCurrentTask.expertIdx);
+                                       xMDataPtr, xMBase, xMEnd, rCurrentTask.expertIdx);
                             }
                             // Check z1Activation is within z1 buffer
                             if (!threadIdx.x && (z1Activation < z1Base || z1Activation >= z1End)) {
@@ -2527,10 +2533,10 @@ namespace flashmoe::processor{
 #if FLASHMOE_DEBUG
                         if (!threadIdx.x && blockIdx.x < 3) {
                             auto* z1Base = bookkeeping.z1();
-                            printf("DEBUG gradPreGEMM rank=%d block=%u tile=%u M=%u: xMOffset=%lld z1Base=%p z1Act=%p aData=%p cData=%p\n",
+                            printf("DEBUG gradPreGEMM rank=%d block=%u tile=%u M=%u: xMOffset=%lld z1Base=%p z1Act=%p aData=%p cData[0]=%p cData[1]=%p\n",
                                    nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx, rCurrentTask.M,
                                    xMOffset, z1Base, z1Activation,
-                                   rCurrentTask.aData, rCurrentTask.cData[w1Index]);
+                                   rCurrentTask.aData, rCurrentTask.cData[w1Index], rCurrentTask.cData[xMIndex]);
                         }
 #endif
                         // grad_a1 [M, P], z1 [M, P] (K=P), W1_stored [P, H] (K=P, N=H), output [M, H]
