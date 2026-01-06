@@ -814,10 +814,15 @@ namespace flashmoe{
             if constexpr (E > 1) {
                 gtQCl = world * nLx * TCM;
                 // maximum gemm tiles/tasks scheduled by subscriber threads
+                // training has 2*TNx + 1 tasks per row vs TNx for inference.
                 static_assert(SUBSCRIBERS % WARP_SIZE == 0);
+                constexpr auto tasksPerRow = (ACC::JT::value == JobType::training) ?
+                    (2 * TNx + 1) : TNx;
+                constexpr auto stage1TasksPerExpert = (ACC::JT::value == JobType::training) ?
+                    (TCM * (TNx + 1)) : cute::ceil_div(TCM * TN, WARP_SIZE);
                 const auto tPS = cute::ceil_div(world * nLx, SUBSCRIBERS / WARP_SIZE) *
-                        cute::ceil_div(TCM * TN, WARP_SIZE) +
-                        cute::ceil_div(TCM * E, SUBSCRIBERS) * ACC::TNx::value;
+                        stage1TasksPerExpert +
+                        cute::ceil_div(TCM * E, SUBSCRIBERS) * tasksPerRow;
                 sT = tPS * SUBSCRIBERS;
                 // 3*gtQCl = tQH (gtQCl) + extended tSA (2*gtQCl) for combine task sync counters
                 ilt = 1 + 1 + nLx + blocks + 3 * gtQCl + 2 * E + E * TCM * TNx;
@@ -870,9 +875,14 @@ namespace flashmoe{
             const auto prT = _world * _nLx * TCM * ACC::TNx::value;
             static_assert(SUBSCRIBERS % WARP_SIZE == 0);
             // maximum gemm tiles/tasks scheduled by subscriber threads
+            // training has 2*TNx + 1 tasks per row vs TNx for inference.
+            constexpr auto tasksPerRow = (ACC::JT::value == JobType::training) ?
+                (2 * ACC::TNx::value + 1) : ACC::TNx::value;
+            constexpr auto stage1TasksPerExpert = (ACC::JT::value == JobType::training) ?
+                (TCM * (ACC::TNx::value + 1)) : cute::ceil_div(TCM * ACC::TN::value, WARP_SIZE);
             const auto tPS = cute::ceil_div(_world * _nLx, SUBSCRIBERS / WARP_SIZE) *
-                    cute::ceil_div(TCM * ACC::TN::value, WARP_SIZE) +
-                    cute::ceil_div(TCM * ACC::E::value, SUBSCRIBERS) * ACC::TNx::value;
+                    stage1TasksPerExpert +
+                    cute::ceil_div(TCM * ACC::E::value, SUBSCRIBERS) * tasksPerRow;
             const auto sT = tPS * SUBSCRIBERS;
             return sT + prT;
         }
