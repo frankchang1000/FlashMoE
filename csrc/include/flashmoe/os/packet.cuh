@@ -454,6 +454,15 @@ namespace flashmoe::packet {
             const auto lS = tN / WARP_SIZE + (rT > 0 ? laneId < rT : 0);
             const auto tSlice = fS + (routedTokens % BLOCK_M == 0 ? 0 : lS);
 
+            if (tSlice > 0) {
+                const auto lastDest = DQ::next(qIdx, tSlice - 1);
+                if (lastDest >= bookkeeping.sT) {
+                    printf("ERROR tQ->ptQ OVERFLOW (fwd/grad init): rank=%u qIdx=%u lastDest=%u sT=%u expert=%u tSlice=%u\n",
+                           nvshmem_my_pe(), qIdx, lastDest, bookkeeping.sT, localExpertIdx, tSlice);
+                    return;
+                }
+            }
+
 #if FLASHMOE_DEBUG
             if (laneId == 0 && localExpertIdx == 0 && routedTokens > 0) {
                 printf("DEBUG DECODER_RANKS: rank=%d peer(EP)=%u gPeer(global)=%u epRank=%u routedTokens=%u\n",
@@ -545,7 +554,13 @@ namespace flashmoe::packet {
 
             const auto emitTask = [&](const Task& task) {
                 const auto slot = atomicAdd(tQHead, 1U);
-                dA.tQ[DQ::sNext(slot)] = task;
+                const auto dest = DQ::sNext(slot);
+                if (dest >= bookkeeping.sT) {
+                    printf("ERROR tQ->ptQ OVERFLOW (P2P init grad): rank=%u slot=%u dest=%u sT=%u expert=%u\n",
+                           nvshmem_my_pe(), slot, dest, bookkeeping.sT, globalExpertIdx);
+                    return;
+                }
+                dA.tQ[dest] = task;
                 __threadfence_system();
             };
 
@@ -592,7 +607,7 @@ namespace flashmoe::packet {
                         cuda::std::array<const cuda::std::byte*, GEMMs>{packet},
                         routedTokens,
                         tileIdx,
-                        globalExpertIdx
+                        localExpertIdx
                     };
                     gradTask.cData[0] = rowPacket;
                     gradTask.cData[1] = rowXM;
@@ -617,7 +632,7 @@ namespace flashmoe::packet {
                     cuda::std::array<const cuda::std::byte*, GEMMs>{packet},
                     routedTokens,
                     0,
-                    globalExpertIdx
+                    localExpertIdx
                 };
                 gateTask.cData[0] = rowPacket;
                 gateTask.cData[1] = rowXM;
@@ -666,7 +681,13 @@ namespace flashmoe::packet {
 
             const auto emitTask = [&](const Task& task) {
                 const auto slot = atomicAdd(tQHead, 1U);
-                dA.tQ[DQ::sNext(slot)] = task;
+                const auto dest = DQ::sNext(slot);
+                if (dest >= bookkeeping.sT) {
+                    printf("ERROR tQ->ptQ OVERFLOW (remote init grad): rank=%u slot=%u dest=%u sT=%u expert=%u\n",
+                           nvshmem_my_pe(), slot, dest, bookkeeping.sT, globalExpertIdx);
+                    return;
+                }
+                dA.tQ[dest] = task;
                 __threadfence_system();
             };
 
@@ -713,7 +734,7 @@ namespace flashmoe::packet {
                         cuda::std::array<const cuda::std::byte*, GEMMs>{packet},
                         routedTokens,
                         tileIdx,
-                        globalExpertIdx
+                        localExpertIdx
                     };
                     gradTask.cData[0] = rowPacket;  // Row-offset destination for split gradients
                     gradTask.cData[1] = rowXM;      // Row-offset xM for notifyGradient chain
@@ -738,7 +759,7 @@ namespace flashmoe::packet {
                     cuda::std::array<const cuda::std::byte*, GEMMs>{packet},
                     routedTokens,
                     0,
-                    globalExpertIdx
+                    localExpertIdx
                 };
                 gateTask.cData[0] = rowPacket;
                 gateTask.cData[1] = rowXM;
@@ -776,7 +797,13 @@ namespace flashmoe::packet {
                 // for unique slot reservation across all blocks. Visibility ordering:
                 // atomicAdd → write → fence ensures task is visible when count is read.
                 const auto slot = atomicAdd(tQHead, 1U);
-                tQ[DQ::sNext(slot)] = task;
+                const auto dest = DQ::sNext(slot);
+                if (dest >= bookkeeping.sT) {
+                    printf("ERROR tQ->ptQ OVERFLOW (P2P last): rank=%u slot=%u dest=%u sT=%u expert=%u\n",
+                           nvshmem_my_pe(), slot, dest, bookkeeping.sT, expertIdx);
+                    return;
+                }
+                tQ[dest] = task;
                 __threadfence_system();
             };
 
@@ -837,7 +864,13 @@ namespace flashmoe::packet {
                 // for unique slot reservation across all blocks. Visibility ordering:
                 // atomicAdd → write → fence ensures task is visible when count is read.
                 const auto slot = atomicAdd(tQHead, 1U);
-                tQ[DQ::sNext(slot)] = task;
+                const auto dest = DQ::sNext(slot);
+                if (dest >= bookkeeping.sT) {
+                    printf("ERROR tQ->ptQ OVERFLOW (P2P grad last): rank=%u slot=%u dest=%u sT=%u expert=%u\n",
+                           nvshmem_my_pe(), slot, dest, bookkeeping.sT, expertIdx);
+                    return;
+                }
+                tQ[dest] = task;
                 __threadfence_system();
             };
 
@@ -860,7 +893,7 @@ namespace flashmoe::packet {
                 cuda::std::array<const cuda::std::byte*, GEMMs>{packet},
                 nTokens,
                 tileIdx,
-                expertIdx
+                localExpertIdx
             };
             gradTask.cData[0] = const_cast<cuda::std::byte*>(packet);  // [M, H]
             gradTask.cData[1] = xMLocation;                            // [M, P]
@@ -886,7 +919,7 @@ namespace flashmoe::packet {
                     cuda::std::array<const cuda::std::byte*, GEMMs>{packet},
                     nTokens,
                     0,
-                    expertIdx
+                    localExpertIdx
                 };
                 gateTask.cData[0] = const_cast<cuda::std::byte*>(packet);
                 gateTask.cData[1] = xMLocation;
@@ -902,10 +935,7 @@ namespace flashmoe::packet {
                 emitTask(gateTask);
             }
 
-            // For remote experts (gradPreGEMM completion signals), create gradInputCombine
-            // Local experts have peerIdx == epRank (initial backward signal)
-            // Remote experts have peerIdx != epRank (gradPreGEMM completion signal)
-            if (peerIdx != dA.epRank) {
+            {
                 Task inputTask{
                     TaskType::gradInputCombine,
                     tokenIndices,                    // aData: TPS array
@@ -940,6 +970,15 @@ namespace flashmoe::packet {
             constexpr auto isGradient = m == JobMode::gradient;
             const auto qIdx = DQ::sNext(lTQHead);
             constexpr auto tNx = ACC::TNx::value;
+            constexpr auto totalTasks = tNx * (isGradient ? 2U : 1U);
+
+            const auto lastDest = DQ::next(qIdx, totalTasks - 1);
+            if (lastDest >= bookkeeping.sT) {
+                printf("ERROR tQ->ptQ OVERFLOW (remote last): rank=%u qIdx=%u lastDest=%u sT=%u expert=%u totalTasks=%u\n",
+                       nvshmem_my_pe(), qIdx, lastDest, bookkeeping.sT, expertIdx, totalTasks);
+                return;
+            }
+
             for (uint i = 0; i < tNx; ++i) {
                 Task gradTask{
                     jobTaskType,
@@ -970,7 +1009,6 @@ namespace flashmoe::packet {
                 }
             }
 
-            constexpr auto totalTasks = tNx * (isGradient ? 2U : 1U);
             lTQHead += totalTasks;
             __threadfence();
             atomicAdd_block(tQHead, totalTasks);
@@ -1004,6 +1042,17 @@ namespace flashmoe::packet {
 
             const auto qIdx = DQ::sNext(lTQHead);
 
+            // For remote experts, we emit tNx + 1 + tNx tasks; otherwise tNx + 1
+            const bool isRemoteExpert = (peerIdx != dA.epRank);
+            const auto totalTasks = isRemoteExpert ? (tNx + 1 + tNx) : (tNx + 1);
+
+            const auto lastDest = DQ::next(qIdx, totalTasks - 1);
+            if (lastDest >= bookkeeping.sT) {
+                printf("ERROR tQ->ptQ OVERFLOW (remote grad last): rank=%u qIdx=%u lastDest=%u sT=%u expert=%u totalTasks=%u\n",
+                       nvshmem_my_pe(), qIdx, lastDest, bookkeeping.sT, expertIdx, totalTasks);
+                return;
+            }
+
             // xMLocation needs row offset: subscriber already offsets packet and tokenIndices,
             // but xM base is per-expert. Add batchIdx * BLOCK_M row offset for consistency.
             const auto xMBaseOffset = (peerIdx * dA.nLx + localExpertIdx) * pEC * P * sizeof(Element);
@@ -1022,7 +1071,7 @@ namespace flashmoe::packet {
                     cuda::std::array<const cuda::std::byte*, GEMMs>{packet},
                     nTokens,
                     i,
-                    expertIdx
+                    localExpertIdx
                 };
                 gradTask.cData[0] = const_cast<cuda::std::byte*>(packet);  // [M, H]
                 gradTask.cData[1] = xMLocation;                            // [M, P]
@@ -1048,7 +1097,7 @@ namespace flashmoe::packet {
                     cuda::std::array<const cuda::std::byte*, GEMMs>{packet},
                     nTokens,
                     0,
-                    expertIdx
+                    localExpertIdx
                 };
                 gateTask.cData[0] = const_cast<cuda::std::byte*>(packet);
                 gateTask.cData[1] = xMLocation;
@@ -1067,7 +1116,6 @@ namespace flashmoe::packet {
             // For remote experts (gradPreGEMM completion signals), create gradInputCombine
             // Local experts have peerIdx == epRank (initial backward signal)
             // Remote experts have peerIdx != epRank (gradPreGEMM completion signal)
-            const bool isRemoteExpert = (peerIdx != dA.epRank);
             if (isRemoteExpert) {
                 for (uint i = 0; i < tNx; ++i) {
                     const auto inputIdx = DQ::next(qIdx, tNx + 1 + i);
@@ -1091,7 +1139,6 @@ namespace flashmoe::packet {
                 }
             }
 
-            const auto totalTasks = isRemoteExpert ? (tNx + 1 + tNx) : (tNx + 1);
             lTQHead += totalTasks;
             __threadfence();
             atomicAdd_block(tQHead, totalTasks);

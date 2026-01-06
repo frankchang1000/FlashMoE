@@ -872,7 +872,8 @@ namespace flashmoe{
         constexpr static auto tQlt(const unsigned int& _nLx, const unsigned int& _world) {
             // maximum gemm tiles/tasks scheduled by processors
             constexpr auto TCM = ACC::TCM::value;
-            const auto prT = _world * _nLx * TCM * ACC::TNx::value;
+            constexpr auto ptQSlotSize = ACC::TN::value + ACC::TNx::value;
+            const auto prT = _world * _nLx * TCM * ptQSlotSize;
             static_assert(SUBSCRIBERS % WARP_SIZE == 0);
             // maximum gemm tiles/tasks scheduled by subscriber threads
             // training has 2*TNx + 1 tasks per row vs TNx for inference.
