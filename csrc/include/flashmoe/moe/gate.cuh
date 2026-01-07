@@ -474,6 +474,15 @@ namespace flashmoe::gate {
                 const auto rowStride = threadIdx.x / elems * elems;
                 const auto colStride = threadIdx.x % elems;
                 constexpr auto convertToRouting = cutlass::NumericConverter<OutputElement, ElementC>{};
+#if FLASHMOE_DEBUG
+                // Debug: verify routingScores are being written in forward pass
+                if (!threadIdx.x && !blockIdx.x && tileIdx == 0) {
+                    printf("DEBUG gate::forward SAVING routingScores: routingPtr=%p rows=%u cols=%u "
+                           "rowBlockBase=%u colBlockBase=%u preSoftmax[0]=%.6e jT=training\n",
+                           routingPtr, rows, cols, rowBlockBase, colBlockBase,
+                           static_cast<float>(preSoftmax[0]));
+                }
+#endif
                 #pragma unroll
                 for (uint ii = 0; ii < trips; ++ii) {
                     const auto colIdx = colStride + ii * elems;
@@ -570,13 +579,6 @@ namespace flashmoe::gate {
             cute::clear(accumulator);
             using OutputElement = typename MatrixC::value_type;
             constexpr auto accumSize = size(accumulator);
-            [[maybe_unused]] ElementC preSoftmax[accumSize];
-            if constexpr (jT == JobType::training) {
-                #pragma unroll
-                for (uint idx = 0; idx < accumSize; ++idx) {
-                    preSoftmax[idx] = accumulator(idx);
-                }
-            }
             constexpr auto bM = cute::get<0>(typename BlockGEMM::BlockTiler{});
             constexpr auto bN = cute::get<1>(typename BlockGEMM::BlockTiler{});
             constexpr auto bK = cute::get<2>(typename BlockGEMM::BlockTiler{});
@@ -649,6 +651,34 @@ namespace flashmoe::gate {
                 for (unsigned int j = 0; j < elems; ++j) {
                     accumulator(j + i * elems) = sC(threadIdx.x, j);
                 }
+            }
+
+            if constexpr (jT == JobType::training) {
+                constexpr auto rows = ACC::S::value;
+                constexpr auto cols = ACC::E::value;
+                const auto routingPtr = gArg.routingScores;
+                constexpr auto routingStride = cols;
+                const auto rowBlockBase = cute::get<0>(tileCoord) * bM;
+                const auto rowIdx = rowBlockBase + threadIdx.x;
+                constexpr auto convertToRouting = cutlass::NumericConverter<OutputElement, ElementC>{};
+                if (rowIdx < rows) {
+                    #pragma unroll
+                    for (uint colIdx = 0; colIdx < cols; ++colIdx) {
+                        routingPtr[rowIdx * routingStride + colIdx] =
+                            convertToRouting(accumulator(colIdx));
+                    }
+                }
+#if FLASHMOE_DEBUG
+                // Debug: verify routingScores are being written in singleBlock forward pass
+                if (!threadIdx.x && !blockIdx.x && tileIdx == 0) {
+                    __threadfence();
+                    printf("DEBUG gate::forward(singleBlock) WROTE routingScores[0,0..3]: %.6e %.6e %.6e %.6e\n",
+                           static_cast<float>(routingPtr[0]),
+                           static_cast<float>(routingPtr[1]),
+                           static_cast<float>(routingPtr[2]),
+                           static_cast<float>(routingPtr[3]));
+                }
+#endif
             }
 
             /// Softmax Reduction
