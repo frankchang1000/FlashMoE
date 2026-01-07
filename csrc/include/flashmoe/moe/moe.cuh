@@ -445,7 +445,7 @@ namespace flashmoe::moe{
                 // }
             }
             else {
-                os::start<processors, d>(
+                os::start<processors, d, true>(
                     workspace,
                     expertsUp,
                     expertsDown,

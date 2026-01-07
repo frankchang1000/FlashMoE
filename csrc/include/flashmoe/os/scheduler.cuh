@@ -312,6 +312,7 @@ namespace flashmoe::scheduler {
     /// Benchmarks confirm an order of magnitude performance improvement for that operation.
     template<
         unsigned int processors,
+        unsigned int blockQStride = ACC::TN::value + ACC::TNx::value,
         unsigned int subscribers = SUBSCRIBERS,
         typename WST
     >
@@ -402,7 +403,7 @@ namespace flashmoe::scheduler {
                 }
                 bitSet[threadIdx.x] = sBS;
                 // schedule observed tasks
-                schedulerLoop<processors>(sQState, tqState, wSet, sO, 0, lTt,
+                schedulerLoop<processors, sL, wS, blockQStride>(sQState, tqState, wSet, sO, 0, lTt,
                     processorTally, gRQIdx, scheduled,
                     wSt, sQ, rQ, pDB, true);
 
@@ -426,7 +427,7 @@ namespace flashmoe::scheduler {
                     }
                     bitSet[sBIdx] = sBS;
                     // schedule observed tasks
-                    schedulerLoop<processors>(sQState, tqState, wSet, sO, i * dQL,
+                    schedulerLoop<processors, sL, wS, blockQStride>(sQState, tqState, wSet, sO, i * dQL,
                         lTt, processorTally, gRQIdx, scheduled,
                         wSt, sQ, rQ, pDB);
                 }
@@ -453,7 +454,7 @@ namespace flashmoe::scheduler {
                 bitSet[sBIdx] = sBS;
             }
             // schedule observed tasks
-            schedulerLoop<processors>(sQState, tqState, wSet, sO, dQL * dT,
+            schedulerLoop<processors, sL, wS, blockQStride>(sQState, tqState, wSet, sO, dQL * dT,
                 lTt, processorTally, gRQIdx, scheduled,
                 wSt, sQ, rQ, pDB, dT == 0);
 

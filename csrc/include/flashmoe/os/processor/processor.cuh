@@ -1059,7 +1059,7 @@ namespace flashmoe::processor{
         constexpr unsigned int preIndex = 0;
 
         const auto offset = ACC::TNx::value * rCurrentTask.batchIdx;
-        constexpr auto ptQSlotSize = ACC::TN::value + ACC::TNx::value;
+        constexpr auto ptQSlotSize = ACC::TN::value + ACC::TNx::value;  // Forward pass: TN + TNx
         auto* __restrict__ tQ = CAST_TO(uint, pA.ptQ + (rCurrentTask.syncIdx * ptQSlotSize));
         const auto cIdx = threadIdx.x % eS;
         // prep memory-view tensors
@@ -1189,7 +1189,7 @@ namespace flashmoe::processor{
         static_assert(capacity % threads == 0);
         constexpr auto elems = capacity * eS / threads;
 
-        constexpr auto ptQSlotSize = ACC::TN::value + ACC::TNx::value;
+        constexpr auto ptQSlotSize = ACC::TN::value + 2 * ACC::TNx::value;
         const auto ptQOffset = rCurrentTask.syncIdx * ptQSlotSize + slotOffset;
         auto* __restrict__ tQ = CAST_TO(uint, pA.ptQ + ptQOffset);
 
@@ -1376,7 +1376,7 @@ namespace flashmoe::processor{
     __device__ __forceinline__
     void notifyGradPreGEMM(uint* __restrict__ const& workspace, const Task& rCurrentTask, const ProcessorArgs& pA) {
         // Use gradIndex=1 because gradPostGEMM output is in cData[1]
-        notifyGradientImpl<TaskType::gradPreGEMM, p, tasks, 1>(workspace, rCurrentTask, pA);
+        notifyGradientImpl<TaskType::gradPreGEMM, p, tasks, 1, false, ACC::TN::value + ACC::TNx::value>(workspace, rCurrentTask, pA);
     }
 
     __device__ __forceinline__

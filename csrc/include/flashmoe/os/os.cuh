@@ -23,6 +23,7 @@ namespace flashmoe::os {
     template<
         unsigned int processors,
         DropTokens d = DropTokens::yes,
+        bool IsBackward = false,
         typename ExpertsUp,
         typename ExpertsDown,
         typename BiasUp,
@@ -102,8 +103,15 @@ namespace flashmoe::os {
         if (!threadIdx.x) {
             // Expert computation expectant tasks
             // unknown a priori
-            *taskBound = bookkeeping.nLx * bookkeeping.world *
-                ACC::TCM::value * (ACC::TN::value + ACC::TNx::value);
+            if constexpr (IsBackward) {
+                // Backward: TN + 2*TNx tasks per tile
+                *taskBound = bookkeeping.nLx * bookkeeping.world *
+                    ACC::TCM::value * (ACC::TN::value + 2 * ACC::TNx::value);
+            } else {
+                // Forward: TN + TNx tasks per tile
+                *taskBound = bookkeeping.nLx * bookkeeping.world *
+                    ACC::TCM::value * (ACC::TN::value + ACC::TNx::value);
+            }
         }
         #pragma unroll
         for (uint i = threadIdx.x; i < E; i += threads) {
@@ -200,7 +208,11 @@ namespace flashmoe::os {
             auto* __restrict__ gtQHeads = bookkeeping.tQH();
             auto* __restrict__ sQ = bookkeeping.sQ();
             auto* __restrict__ pDB = bookkeeping.pDB();
-            scheduler::start<processors>(wSt, interruptScratch, schedulerBitSet,
+            // Forward: TN + TNx stride, Backward: TN + 2*TNx stride
+            constexpr auto blockQStride = IsBackward
+                ? (ACC::TN::value + 2 * ACC::TNx::value)
+                : (ACC::TN::value + ACC::TNx::value);
+            scheduler::start<processors, blockQStride>(wSt, interruptScratch, schedulerBitSet,
                 sO, gtQCl, interrupt, tQHeads,
                 gtQHeads, taskBound, rQ, sQ, pDB);
         }
