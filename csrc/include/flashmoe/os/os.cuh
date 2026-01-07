@@ -212,8 +212,15 @@ namespace flashmoe::os {
             constexpr auto blockQStride = IsBackward
                 ? (ACC::TN::value + 2 * ACC::TNx::value)
                 : (ACC::TN::value + ACC::TNx::value);
-            scheduler::start<processors, blockQStride>(wSt, interruptScratch, schedulerBitSet,
-                sO, gtQCl, interrupt, tQHeads,
+            // For backward pass:
+            // - schedulerGtQCl = 2*gtQCl to poll both primary (gradPostGEMM/gradGateGEMM) and secondary (gradPreGEMM) domains
+            // - gtQClBase = gtQCl is the boundary between primary and secondary domains
+            // - secondaryDomainOffset = TN + TNx is the ptQ offset where gradPreGEMM tasks are written
+            // For forward pass: secondaryDomainOffset = 0, so secondary domain logic is compiled out
+            constexpr auto secondaryDomainOffset = IsBackward ? (ACC::TN::value + ACC::TNx::value) : 0;
+            const auto schedulerGtQCl = IsBackward ? (2 * gtQCl) : gtQCl;
+            scheduler::start<processors, blockQStride, secondaryDomainOffset>(wSt, interruptScratch, schedulerBitSet,
+                sO, schedulerGtQCl, gtQCl, interrupt, tQHeads,
                 gtQHeads, taskBound, rQ, sQ, pDB);
         }
         else {

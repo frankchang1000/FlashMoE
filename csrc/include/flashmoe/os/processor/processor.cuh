@@ -1173,7 +1173,8 @@ namespace flashmoe::processor{
         unsigned int tasks = ACC::TNx::value,
         unsigned int gradIndex = 0,  // Which cData index to use as new task's aData
         bool preserveAData = false,
-        unsigned int slotOffset = 0> // Offset within ptQ slot (e.g., TN for gradGateGEMM to write after gradPostGEMM)
+        unsigned int slotOffset = 0, // Offset within ptQ slot (e.g., TN for gradGateGEMM to write after gradPostGEMM)
+        bool useSecondaryTQH = false> // Use secondary tQH domain (syncIdx + gtQCl) for gradPreGEMM tasks
     __device__ __forceinline__
     void notifyGradientImpl(uint* __restrict__ const& workspace, const Task& rCurrentTask, const ProcessorArgs& pA) {
         static_assert(sizeof(Task) == 128);
@@ -1334,14 +1335,17 @@ namespace flashmoe::processor{
         __syncthreads();
         if (!threadIdx.x) {
             __threadfence();
+            // For gradPreGEMM (useSecondaryTQH=true), write to tQH[syncIdx + gtQCl] so scheduler
+            // can poll it separately from the already-visited primary domain (gradPostGEMM/gradGateGEMM)
+            const auto tQHSyncIdx = useSecondaryTQH ? (rCurrentTask.syncIdx + bookkeeping.gtQCl) : rCurrentTask.syncIdx;
 #if FLASHMOE_DEBUG
-            const auto tQH_before = atomicAdd(pA.tQH + rCurrentTask.syncIdx, 0U);
+            const auto tQH_before = atomicAdd(pA.tQH + tQHSyncIdx, 0U);
 #endif
-            atomicAdd(pA.tQH + rCurrentTask.syncIdx, tasks);
+            atomicAdd(pA.tQH + tQHSyncIdx, tasks);
 // #if FLASHMOE_DEBUG
 //             if (blockIdx.x < 2) {
-//                 printf("DEBUG notifyGradientImpl DONE: block=%u TaskT=%u syncIdx=%u tQH_before=%u adding=%u tQH_after=%u\n",
-//                        blockIdx.x, static_cast<unsigned>(TaskT), rCurrentTask.syncIdx,
+//                 printf("DEBUG notifyGradientImpl DONE: block=%u TaskT=%u syncIdx=%u tQHSyncIdx=%u tQH_before=%u adding=%u tQH_after=%u\n",
+//                        blockIdx.x, static_cast<unsigned>(TaskT), rCurrentTask.syncIdx, tQHSyncIdx,
 //                        tQH_before, tasks, tQH_before + tasks);
 //             }
 // #endif
@@ -1376,7 +1380,9 @@ namespace flashmoe::processor{
     __device__ __forceinline__
     void notifyGradPreGEMM(uint* __restrict__ const& workspace, const Task& rCurrentTask, const ProcessorArgs& pA) {
         // Use gradIndex=1 because gradPostGEMM output is in cData[1]
-        notifyGradientImpl<TaskType::gradPreGEMM, p, tasks, 1, false, ACC::TN::value + ACC::TNx::value>(workspace, rCurrentTask, pA);
+        // Use useSecondaryTQH=true to write to tQH[syncIdx + gtQCl], giving gradPreGEMM tasks
+        // a fresh scheduler polling domain (since the primary domain is already marked "visited")
+        notifyGradientImpl<TaskType::gradPreGEMM, p, tasks, 1, false, ACC::TN::value + ACC::TNx::value, true>(workspace, rCurrentTask, pA);
     }
 
     __device__ __forceinline__

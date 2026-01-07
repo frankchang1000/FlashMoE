@@ -824,8 +824,8 @@ namespace flashmoe{
                         stage1TasksPerExpert +
                         cute::ceil_div(TCM * E, SUBSCRIBERS) * tasksPerRow;
                 sT = tPS * SUBSCRIBERS;
-                // 3*gtQCl = tQH (gtQCl) + extended tSA (2*gtQCl) for combine task sync counters
-                ilt = 1 + 1 + nLx + blocks + 3 * gtQCl + 2 * E + E * TCM * TNx;
+                // 4*gtQCl = tQH (2*gtQCl for gradPostGEMM/gradGateGEMM + gradPreGEMM) + extended tSA (2*gtQCl for combine task sync counters)
+                ilt = 1 + 1 + nLx + blocks + 4 * gtQCl + 2 * E + E * TCM * TNx;
             }
         }
 
@@ -984,9 +984,10 @@ namespace flashmoe{
             return eCSync() + 1;
         }
         /// tile sync array
+        /// tQH uses 2*gtQCl entries: [0, gtQCl) for gradPostGEMM/gradGateGEMM, [gtQCl, 2*gtQCl) for gradPreGEMM
         __device__ __forceinline__
         auto* tSA() const {
-            return tQH() + gtQCl;
+            return tQH() + 2 * gtQCl;
         }
         __device__ __forceinline__
         auto* sQ() const {
@@ -1005,8 +1006,8 @@ namespace flashmoe{
             sizeof(BookType) == sizeof(mp_t));
         __host__ __device__ __forceinline__
         unsigned long queueSpanEntries() const {
-            // 3*gtQCl = gtQCl (tQH) + 2*gtQCl (extended tSA for combine task sync counters)
-            return 3UL * gtQCl +
+            // 4*gtQCl = 2*gtQCl (tQH for gradPostGEMM/gradGateGEMM + gradPreGEMM) + 2*gtQCl (extended tSA for combine task sync counters)
+            return 4UL * gtQCl +
                 ACC::PeakHardware::OS::processorBlocks::value +
                 2UL * ACC::E::value;
         }
@@ -1085,8 +1086,8 @@ namespace flashmoe{
             const auto gtQCl = _world * _nLx * ACC::TCM::value;
             constexpr auto flt = 2 * ACC::E::value + 1;
             static_assert(sizeof(LXI) == sizeof(BookType) && alignof(LXI) == alignof(BookType));
-            // 3*gtQCl = tQH (gtQCl) + extended tSA (2*gtQCl) for combine task sync counters
-            const auto ilt = 1 + 1 + _nLx + blocks + 3 * gtQCl + 2 * ACC::E::value +
+            // 4*gtQCl = tQH (2*gtQCl for gradPostGEMM/gradGateGEMM + gradPreGEMM) + extended tSA (2*gtQCl for combine task sync counters)
+            const auto ilt = 1 + 1 + _nLx + blocks + 4 * gtQCl + 2 * ACC::E::value +
                 ACC::E::value * ACC::TCM::value * ACC::TNx::value;
             static_assert(sizeof(mp_t) == sizeof(BookType) && alignof(mp_t) == alignof(BookType));
             return flt + ilt;

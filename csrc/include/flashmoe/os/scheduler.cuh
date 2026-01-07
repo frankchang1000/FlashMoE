@@ -66,6 +66,7 @@ namespace flashmoe::scheduler {
         unsigned int sL = (THREADS - WARP_SIZE) / WARP_SIZE,
         unsigned int wS = WARP_SIZE,
         unsigned int blockQStride = ACC::TN::value + ACC::TNx::value,
+        unsigned int secondaryDomainOffset = 0,
         typename WarpScan = cub::WarpScan<uint>,
         typename SQState,
         typename TQState,
@@ -77,6 +78,7 @@ namespace flashmoe::scheduler {
     void schedulerLoop(SQState& sQState, TQState& tqState, WSet& wSet,
         const unsigned int& tQOffset,
         const unsigned int& gTbO,
+        const unsigned int& gtQClBase,
         uint& lTt, uint& processorTally,
         uint& gRQIdx, uint& scheduled,
         typename WarpScan::TempStorage* __restrict__ const& wSt,
@@ -178,7 +180,19 @@ namespace flashmoe::scheduler {
                 for (uint j = sL; j < TQState::kElements; ++j) {
                     if (tqState[j].tasks && tasksToSchedule) {
                         const auto canSchedule = cute::min(tasksToSchedule, tqState[j].tasks);
-                        const auto qHead = (wS * (gTbO + (j - sL)) + threadIdx.x) * blockQStride + tqState[j].tQTail;
+                        const auto syncIdx = wS * (gTbO + (j - sL)) + threadIdx.x;
+                        // Secondary domain: syncIdx >= gtQClBase maps to ptQ[(syncIdx - gtQClBase) * stride + secondaryDomainOffset]
+                        // Primary domain: syncIdx < gtQClBase maps to ptQ[syncIdx * stride] (unchanged)
+                        uint qHead;
+                        if constexpr (secondaryDomainOffset > 0) {
+                            if (syncIdx >= gtQClBase) {
+                                qHead = (syncIdx - gtQClBase) * blockQStride + secondaryDomainOffset + tqState[j].tQTail;
+                            } else {
+                                qHead = syncIdx * blockQStride + tqState[j].tQTail;
+                            }
+                        } else {
+                            qHead = syncIdx * blockQStride + tqState[j].tQTail;
+                        }
                         const auto qIdx = tQOffset + qHead;
                         tasksToSchedule -= canSchedule;
                         tqState[j].tasks -= canSchedule;
@@ -313,6 +327,7 @@ namespace flashmoe::scheduler {
     template<
         unsigned int processors,
         unsigned int blockQStride = ACC::TN::value + ACC::TNx::value,
+        unsigned int secondaryDomainOffset = 0,
         unsigned int subscribers = SUBSCRIBERS,
         typename WST
     >
@@ -323,6 +338,7 @@ namespace flashmoe::scheduler {
         BitSet* __restrict__ const& bitSet,
         const unsigned int& sO,
         const unsigned int& gtQCL,
+        const unsigned int& gtQClBase,
         unsigned int* __restrict__ const& sInterrupts,
         unsigned int* __restrict__ const& tQHeads, // shared
         unsigned int* __restrict__ const& gtQHeads, // global
@@ -403,7 +419,7 @@ namespace flashmoe::scheduler {
                 }
                 bitSet[threadIdx.x] = sBS;
                 // schedule observed tasks
-                schedulerLoop<processors, sL, wS, blockQStride>(sQState, tqState, wSet, sO, 0, lTt,
+                schedulerLoop<processors, sL, wS, blockQStride, secondaryDomainOffset>(sQState, tqState, wSet, sO, 0, gtQClBase, lTt,
                     processorTally, gRQIdx, scheduled,
                     wSt, sQ, rQ, pDB, true);
 
@@ -427,7 +443,7 @@ namespace flashmoe::scheduler {
                     }
                     bitSet[sBIdx] = sBS;
                     // schedule observed tasks
-                    schedulerLoop<processors, sL, wS, blockQStride>(sQState, tqState, wSet, sO, i * dQL,
+                    schedulerLoop<processors, sL, wS, blockQStride, secondaryDomainOffset>(sQState, tqState, wSet, sO, i * dQL, gtQClBase,
                         lTt, processorTally, gRQIdx, scheduled,
                         wSt, sQ, rQ, pDB);
                 }
@@ -454,7 +470,7 @@ namespace flashmoe::scheduler {
                 bitSet[sBIdx] = sBS;
             }
             // schedule observed tasks
-            schedulerLoop<processors, sL, wS, blockQStride>(sQState, tqState, wSet, sO, dQL * dT,
+            schedulerLoop<processors, sL, wS, blockQStride, secondaryDomainOffset>(sQState, tqState, wSet, sO, dQL * dT, gtQClBase,
                 lTt, processorTally, gRQIdx, scheduled,
                 wSt, sQ, rQ, pDB, dT == 0);
 
