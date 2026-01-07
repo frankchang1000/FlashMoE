@@ -1,5 +1,21 @@
 # FlashDMoE: Fast Distributed MoE in a Single Kernel
 
+This is a fork of osayamenja's work. My work implements the backwards kernel for FlashDMoE. It has been tested on 2xH100 as well as 2xA100 with the config in flashmoe/csrc/flashmoe_config.json. The architecture for 
+the backwards pass can be found in docs/backwards_pass.md. The memory layout for the backwards kernel can be found in docs/memory_layout.md. benchmarks for the backwards kernel are WIP.
+
+To replicate, first install FlashMoE with
+
+```bash
+pip install -e . --no-build-isolation
+```
+
+and then run the following script:
+
+```bash
+mpirun -np 2 python -u scripts/run_gradcheck.py \
+  > out.log 2>&1
+```
+
 ⚡ A high-performance GPU kernel for MoE workloads  
 🚧 Under active research
 
