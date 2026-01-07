@@ -2198,8 +2198,44 @@ namespace flashmoe::processor{
                                 auto* slot = gateBuffer + firstTokenIdx * E + globalExpertIdx;
                                 printf("DEBUG gradGateCombine SUMMARY: block=%u tile=%u firstToken=%u localExpert=%u globalExpert=%u\n",
                                        blockIdx.x, rCurrentTask.tileIdx, firstTokenIdx, localExpertIdx, globalExpertIdx);
-                                printf("  gateBuffer[%u, %u] slot=%p val=%.9e\n",
+                                printf("  gateBuffer[%u, %u] slot=%p val=%.6e\n",
                                        firstTokenIdx, globalExpertIdx, slot, static_cast<float>(*slot));
+                            }
+                        }
+                        // SANITY CHECK: Recompute expected dot product for first token and compare
+                        if (!threadIdx.x && nvshmem_my_pe() == 0 && blockIdx.x < 4) {
+                            printf("SANITY gradGateCombine: rank=%d block=%u tileSize=%u localExpert=%u globalExpert=%u\n",
+                                   nvshmem_my_pe(), blockIdx.x, tileSize, localExpertIdx, globalExpertIdx);
+                            if (tileSize > 0) {
+                                const auto tok0 = tokenIds[0].tokenIdx;
+                                if (tok0 < S) {
+                                    // Recompute expected dot product: Σ_h gradOutput[tok0, h] * z2[0, h]
+                                    const auto rowOffset0 = static_cast<size_t>(0) * hiddenStride;
+                                    const auto* __restrict__ const expertRow0 = z2RowBase + rowOffset0;
+                                    ComputeElement expectedSum = ComputeElement(0);
+                                    for (uint n = 0; n < H; ++n) {
+                                        expectedSum = fmaf(toCompute(mGradOut(tok0, n)), toCompute(expertRow0[n]), expectedSum);
+                                    }
+                                    // Print sample inputs
+                                    printf("  TPS[0]: tokenIdx=%u\n", tok0);
+                                    printf("  gradOut[%u,0..3]: %.6e %.6e %.6e %.6e\n",
+                                           tok0,
+                                           static_cast<float>(mGradOut(tok0, 0)),
+                                           static_cast<float>(mGradOut(tok0, 1)),
+                                           static_cast<float>(mGradOut(tok0, 2)),
+                                           static_cast<float>(mGradOut(tok0, 3)));
+                                    printf("  z2Row[0..3]: %.6e %.6e %.6e %.6e\n",
+                                           static_cast<float>(expertRow0[0]),
+                                           static_cast<float>(expertRow0[1]),
+                                           static_cast<float>(expertRow0[2]),
+                                           static_cast<float>(expertRow0[3]));
+                                    // Read actual value from gateBuffer
+                                    auto* slot0 = gateBuffer + tok0 * E + globalExpertIdx;
+                                    const float actualVal = static_cast<float>(*slot0);
+                                    const float expectedVal = static_cast<float>(expectedSum);
+                                    printf("  VERIFY: expected dotprod=%.6e, actual gateBuffer[%u,%u]=%.6e\n",
+                                           expectedVal, tok0, globalExpertIdx, actualVal);
+                                }
                             }
                         }
 #endif
