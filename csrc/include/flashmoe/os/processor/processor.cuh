@@ -2317,7 +2317,7 @@ namespace flashmoe::processor{
                         const auto* __restrict__ const tokenIds = CONST_CAST_TO(TPS, rCurrentTask.aData);
                         const auto* __restrict__ const hiddenStates = CONST_CAST_TO(Element, rCurrentTask.bData[0]);
                         const auto* __restrict__ const gateWeights = CONST_CAST_TO(Element, rCurrentTask.bData[1]);
-                        const auto* __restrict__ const gradRouting = CONST_CAST_TO(Element, rCurrentTask.cData[0]);
+                        const auto* __restrict__ const gradRouting = bookkeeping.gGateCombine();
                         auto* __restrict__ const gradInput = const_cast<Element*>(CONST_CAST_TO(Element, rCurrentTask.dData[0]));
                         auto* __restrict__ const routingScores = bookkeeping.gateRoutingScores();
                         auto* __restrict__ const gateWeightGrad = bookkeeping.gGateW();
@@ -2329,10 +2329,102 @@ namespace flashmoe::processor{
 #if FLASHMOE_DEBUG
                         if (!threadIdx.x && blockIdx.x < 3) {
                             printf("DEBUG gradGateGEMM rank=%d block=%u tile=%u tileSize=%u syncIdx=%u "
-                                   "gradRouting=%p gradInput=%p gateWeightGrad=%p tokenIdx[0]=%u\n",
+                                   "gradRouting(gGateCombine)=%p gradInput=%p gateWeightGrad=%p tokenIdx[0]=%u\n",
                                    nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx, tileSize, rCurrentTask.syncIdx,
                                    gradRouting, gradInput, gateWeightGrad,
                                    tileSize > 0 ? tokenIds[0].tokenIdx : 0u);
+                            // Debug: verify routingScores pointer matches forward pass
+                            printf("DEBUG gradGateGEMM POINTERS: routingScores=%p (should match gate::forward routingPtr)\n",
+                                   routingScores);
+                            // Sample the first few values to verify they were written
+                            printf("DEBUG gradGateGEMM routingScores[0,0..3]: %.6e %.6e %.6e %.6e\n",
+                                   static_cast<float>(routingScores[0]),
+                                   static_cast<float>(routingScores[1]),
+                                   static_cast<float>(routingScores[2]),
+                                   static_cast<float>(routingScores[3]));
+                        }
+                        // DEBUG: Print INPUT values for gradGateGEMM correctness verification
+                        // Math: gradRoutingSoftmax[e] = softmax[e] * (gradRouting[e] - dot)
+                        //       gateWeightGrad[h,e] += hidden[h] * gradRoutingSoftmax[e]
+                        //       gradInput[h] += sum_e(gateWeights[e,h] * gradRoutingSoftmax[e])
+                        if (!threadIdx.x && nvshmem_my_pe() == 0 && blockIdx.x < 2 && tileSize > 0) {
+                            const auto tokenIdx0 = tokenIds[0].tokenIdx;
+                            const auto* gradRoutingRow0 = gradRouting + tokenIdx0 * E;
+                            const auto* scoreRow0 = routingScores + tokenIdx0 * E;
+                            const auto* hiddenRow0 = hiddenStates + tokenIdx0 * H;
+                            printf("DEBUG gradGateGEMM VALUES: rank=%d block=%u tileIdx=%u tileSize=%u tokenIdx[0]=%u E=%u\n",
+                                   nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx, tileSize, tokenIdx0, E);
+                            // Sample gradRouting values (from gradGateCombine)
+                            printf("  gradRouting[token=%u, 0..min(3,E)]: ", tokenIdx0);
+                            for (uint e = 0; e < min(4u, E); ++e) {
+                                printf("%.6e ", static_cast<float>(gradRoutingRow0[e]));
+                            }
+                            printf("\n");
+                            // Sample routing scores (saved logits)
+                            printf("  routingScores[token=%u, 0..min(3,E)]: ", tokenIdx0);
+                            for (uint e = 0; e < min(4u, E); ++e) {
+                                printf("%.6e ", static_cast<float>(scoreRow0[e]));
+                            }
+                            printf("\n");
+                            // Sample hidden states
+                            printf("  hiddenStates[token=%u, 0..3]: %.6e %.6e %.6e %.6e\n", tokenIdx0,
+                                   static_cast<float>(hiddenRow0[0]),
+                                   static_cast<float>(hiddenRow0[1]),
+                                   static_cast<float>(hiddenRow0[2]),
+                                   static_cast<float>(hiddenRow0[3]));
+                            // Sample gate weights (stored as [E, H])
+                            printf("  gateWeights[0, 0..3]: %.6e %.6e %.6e %.6e\n",
+                                   static_cast<float>(gateWeights[0 * H + 0]),
+                                   static_cast<float>(gateWeights[0 * H + 1]),
+                                   static_cast<float>(gateWeights[0 * H + 2]),
+                                   static_cast<float>(gateWeights[0 * H + 3]));
+                            // Manually compute softmax for verification (compute on-the-fly to avoid large arrays)
+                            float maxScore = -1e30f;
+                            for (uint e = 0; e < E; ++e) {
+                                float val = static_cast<float>(scoreRow0[e]);
+                                if (val > maxScore) maxScore = val;
+                            }
+                            float sumExp = 0.0f;
+                            for (uint e = 0; e < E; ++e) {
+                                sumExp += expf(static_cast<float>(scoreRow0[e]) - maxScore);
+                            }
+                            if (sumExp == 0.0f) sumExp = 1.0f;
+                            // Print softmax for first 4 experts
+                            printf("  computed softmax[0..min(3,E)]: ");
+                            for (uint e = 0; e < min(4u, E); ++e) {
+                                float softmax_e = expf(static_cast<float>(scoreRow0[e]) - maxScore) / sumExp;
+                                printf("%.6e ", softmax_e);
+                            }
+                            printf("\n");
+                            // Compute dot = sum_e(softmax[e] * gradRouting[e])
+                            float dot = 0.0f;
+                            for (uint e = 0; e < E; ++e) {
+                                float softmax_e = expf(static_cast<float>(scoreRow0[e]) - maxScore) / sumExp;
+                                dot += softmax_e * static_cast<float>(gradRoutingRow0[e]);
+                            }
+                            printf("  computed dot (sum softmax*gradRouting): %.6e\n", dot);
+                            // Print gradRoutingSoftmax for first 4 experts
+                            printf("  computed gradRoutingSoftmax[0..min(3,E)]: ");
+                            for (uint e = 0; e < min(4u, E); ++e) {
+                                float softmax_e = expf(static_cast<float>(scoreRow0[e]) - maxScore) / sumExp;
+                                float gradRS_e = softmax_e * (static_cast<float>(gradRoutingRow0[e]) - dot);
+                                printf("%.6e ", gradRS_e);
+                            }
+                            printf("\n");
+                            // Expected gateWeightGrad[0,0] contribution from this token = hidden[0] * gradRoutingSoftmax[0]
+                            float softmax_0 = expf(static_cast<float>(scoreRow0[0]) - maxScore) / sumExp;
+                            float gradRS_0 = softmax_0 * (static_cast<float>(gradRoutingRow0[0]) - dot);
+                            float expectedGWGrad00 = static_cast<float>(hiddenRow0[0]) * gradRS_0;
+                            printf("  expected gateWeightGrad[0,0] contrib from token %u: %.6e (hidden[0]=%.6e * gradRS[0]=%.6e)\n",
+                                   tokenIdx0, expectedGWGrad00, static_cast<float>(hiddenRow0[0]), gradRS_0);
+                            // Expected gradInput[0] contribution from this token = sum_e(gateWeights[e,0] * gradRoutingSoftmax[e])
+                            float expectedGradInput0 = 0.0f;
+                            for (uint e = 0; e < E; ++e) {
+                                float softmax_e = expf(static_cast<float>(scoreRow0[e]) - maxScore) / sumExp;
+                                float gradRS_e = softmax_e * (static_cast<float>(gradRoutingRow0[e]) - dot);
+                                expectedGradInput0 += static_cast<float>(gateWeights[e * H + 0]) * gradRS_e;
+                            }
+                            printf("  expected gradInput[token=%u, h=0] contrib: %.6e\n", tokenIdx0, expectedGradInput0);
                         }
 #endif
 
@@ -2409,6 +2501,66 @@ namespace flashmoe::processor{
                                    "gateWeightGrad[0]=%.6f gradInput=%p\n",
                                    nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx, tileSize, rCurrentTask.syncIdx,
                                    static_cast<float>(gateWeightGrad[0]), gradInput);
+                        }
+                        // DEBUG: Output verification for gradGateGEMM
+                        // Note: Values are accumulated via atomicAdd, so we can only verify after all blocks complete
+                        // Here we just show the current accumulated values for inspection
+                        if (!threadIdx.x && nvshmem_my_pe() == 0 && blockIdx.x < 2 && tileSize > 0) {
+                            const auto tokenIdx0 = tokenIds[0].tokenIdx;
+                            const auto* gradInputRow0 = gradInput + tokenIdx0 * H;
+                            // Show gateWeightGrad values (accumulated across all tokens)
+                            printf("  OUTPUT gateWeightGrad[0..3, 0] (h=0..3, e=0): %.6e %.6e %.6e %.6e\n",
+                                   static_cast<float>(gateWeightGrad[0 * E + 0]),
+                                   static_cast<float>(gateWeightGrad[1 * E + 0]),
+                                   static_cast<float>(gateWeightGrad[2 * E + 0]),
+                                   static_cast<float>(gateWeightGrad[3 * E + 0]));
+                            printf("  OUTPUT gateWeightGrad[0, 0..min(3,E)] (h=0, e=0..3): ");
+                            for (uint e = 0; e < min(4u, E); ++e) {
+                                printf("%.6e ", static_cast<float>(gateWeightGrad[0 * E + e]));
+                            }
+                            printf("\n");
+                            // Show gradInput values for token 0 (accumulated from gate contribution)
+                            printf("  OUTPUT gradInput[token=%u, 0..3] (gate contrib, accumulated): %.6e %.6e %.6e %.6e\n",
+                                   tokenIdx0,
+                                   static_cast<float>(gradInputRow0[0]),
+                                   static_cast<float>(gradInputRow0[1]),
+                                   static_cast<float>(gradInputRow0[2]),
+                                   static_cast<float>(gradInputRow0[3]));
+                            // Recompute expected values for verification (compute on-the-fly to avoid large arrays)
+                            const auto* gradRoutingRow0 = gradRouting + tokenIdx0 * E;
+                            const auto* scoreRow0 = routingScores + tokenIdx0 * E;
+                            const auto* hiddenRow0 = hiddenStates + tokenIdx0 * H;
+                            float maxScore = -1e30f;
+                            for (uint e = 0; e < E; ++e) {
+                                float val = static_cast<float>(scoreRow0[e]);
+                                if (val > maxScore) maxScore = val;
+                            }
+                            float sumExp = 0.0f;
+                            for (uint e = 0; e < E; ++e) {
+                                sumExp += expf(static_cast<float>(scoreRow0[e]) - maxScore);
+                            }
+                            if (sumExp == 0.0f) sumExp = 1.0f;
+                            // Compute dot on-the-fly
+                            float dot = 0.0f;
+                            for (uint e = 0; e < E; ++e) {
+                                float softmax_e = expf(static_cast<float>(scoreRow0[e]) - maxScore) / sumExp;
+                                dot += softmax_e * static_cast<float>(gradRoutingRow0[e]);
+                            }
+                            // Verify gateWeightGrad[0,0] contribution from token0
+                            float softmax_0 = expf(static_cast<float>(scoreRow0[0]) - maxScore) / sumExp;
+                            float gradRS_0 = softmax_0 * (static_cast<float>(gradRoutingRow0[0]) - dot);
+                            float expectedGWGrad00 = static_cast<float>(hiddenRow0[0]) * gradRS_0;
+                            printf("  VERIFY gateWeightGrad[0,0] expected contrib from token %u: %.6e\n",
+                                   tokenIdx0, expectedGWGrad00);
+                            // Verify gradInput[token0, h=0] contribution
+                            float expectedGradInput0 = 0.0f;
+                            for (uint e = 0; e < E; ++e) {
+                                float softmax_e = expf(static_cast<float>(scoreRow0[e]) - maxScore) / sumExp;
+                                float gradRS_e = softmax_e * (static_cast<float>(gradRoutingRow0[e]) - dot);
+                                expectedGradInput0 += static_cast<float>(gateWeights[e * H + 0]) * gradRS_e;
+                            }
+                            printf("  VERIFY gradInput[token=%u, h=0] expected contrib: %.6e, actual accumulated: %.6e\n",
+                                   tokenIdx0, expectedGradInput0, static_cast<float>(gradInputRow0[0]));
                         }
 #endif
                     }
