@@ -105,6 +105,8 @@ namespace flashmoe::moe{
         }
         for (uint i = idx; i < gtQCl; i += blocks * threads) {
             tQH[i] = tQHeadGroundState;
+        }
+        for (uint i = idx; i < 2 * gtQCl; i += blocks * threads) {
             tSA[i] = 0U;
         }
         for (uint i = idx; i < ACC::E::value; i += blocks * threads) {
