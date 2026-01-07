@@ -405,7 +405,7 @@ namespace flashmoe::processor{
                     for (uint j = 0; j < elems; ++j) {
                         const auto cIdx = threadIdx.x % elems + i * elems;
                         if (phaseIdx + j * phases < tileSize) {
-                            atomicAdd(CAST_TO(CDxT, &gExpertGrad(phaseIdx + j * phases, cIdx)), rC(j + i * elems));
+                            *CAST_TO(CDxT, &gExpertGrad(phaseIdx + j * phases, cIdx)) = rC(j + i * elems);
                         }
                     }
                 }
@@ -413,7 +413,7 @@ namespace flashmoe::processor{
                     #pragma unroll
                     for (uint j = 0; j < elems; ++j) {
                         const auto cIdx = threadIdx.x % elems + i * elems;
-                        atomicAdd(CAST_TO(CDxT, &gExpertGrad(phaseIdx + j * phases, cIdx)), rC(j + i * elems));
+                        *CAST_TO(CDxT, &gExpertGrad(phaseIdx + j * phases, cIdx)) = rC(j + i * elems);
                     }
                 }
             }
