@@ -145,25 +145,6 @@ namespace flashmoe::packet {
                                tps3.tokenIdx, static_cast<float>(tps3.probability));
                     }
 #endif
-// #if FLASHMOE_DEBUG
-//                     if (isLeader && !lBid) {
-//                         constexpr unsigned int debugMaxExperts = 8;
-//                         if (expertIdx < debugMaxExperts) {
-//                             const auto totalTiles = Bookkeeping::tiles<BLOCK_M>(routedTokens);
-//                             printf("DEBUG dispatch rank=%d sb=%u expert=%u peer=%u routed=%u tiles=%u partition=%u residue=%u remote=%u gradSeq=%u\n",
-//                                    nvshmem_my_pe(),
-//                                    rSeqBit,
-//                                    expertIdx,
-//                                    lI.peer,
-//                                    routedTokens,
-//                                    totalTiles,
-//                                    partition,
-//                                    residueCount,
-//                                    static_cast<unsigned>(lI.isRemote),
-//                                    static_cast<unsigned>(isGradientSeq));
-//                         }
-//                     }
-// #endif
                     if (trips) {
                         // prefetch
                         // global -> shared
@@ -270,33 +251,6 @@ namespace flashmoe::packet {
                                 lI.pTTt,
                                 rSeqBit
                             };
-#if FLASHMOE_DEBUG
-                            // if (!isGradientSeq) {
-                            //     printf("DEBUG fwd dispatch signal rank=%d block=%u sb=%u expert=%u peer=%u routed=%u totalTiles=%u remote=%u flag=%u flagPtr=%p\n",
-                            //            nvshmem_my_pe(),
-                            //            blockIdx.x,
-                            //            rSeqBit,
-                            //            expertIdx,
-                            //            lI.peer,
-                            //            routedTokens,
-                            //            lI.pTTt,
-                            //            static_cast<unsigned>(lI.isRemote),
-                            //            flagOffset,
-                            //            flags + flagOffset);
-                            // }
-                            // if (isGradientSeq) {
-                            //     printf("DEBUG grad packet initial signal sb=%u expert=%u peer=%u routed=%u totalTiles=%u partition=%u residue=%u remote=%u flag=%u\n",
-                            //            rSeqBit,
-                            //            expertIdx,
-                            //            lI.peer,
-                            //            routedTokens,
-                            //            lI.pTTt,
-                            //            partition,
-                            //            residueCount,
-                            //            static_cast<unsigned>(lI.isRemote),
-                            //            flagOffset);
-                            // }
-#endif
                             if (lI.isRemote) {
                                 // do RDMA transfer + signal
                                 nvshmem_putmem_signal_nbi(
@@ -324,28 +278,6 @@ namespace flashmoe::packet {
                         lI.pTTt,
                         rSeqBit
                     };
-// #if FLASHMOE_DEBUG
-//                     if (!isGradientSeq) {
-//                         printf("DEBUG fwd dispatch noop rank=%d block=%u sb=%u expert=%u peer=%u totalTiles=%u remote=%u flag=%u\n",
-//                                nvshmem_my_pe(),
-//                                blockIdx.x,
-//                                rSeqBit,
-//                                expertIdx,
-//                                lI.peer,
-//                                lI.pTTt,
-//                                static_cast<unsigned>(lI.isRemote),
-//                                flagOffset);
-//                     }
-//                     if (isGradientSeq) {
-//                         printf("DEBUG grad packet initial noop sb=%u expert=%u peer=%u totalTiles=%u remote=%u flag=%u\n",
-//                                rSeqBit,
-//                                expertIdx,
-//                                lI.peer,
-//                                lI.pTTt,
-//                                static_cast<unsigned>(lI.isRemote),
-//                                flagOffset);
-//                     }
-// #endif
                     if (lI.isRemote) {
                         // transmit signal
                         nvshmemx_signal_op(flags + flagOffset,
@@ -525,7 +457,6 @@ namespace flashmoe::packet {
     };
 
     /// Specialized initial gradient decoder for P2P
-    /// Emits gradCombine + gradGateCombine instead of gradPostGEMM
     template<typename Element>
     struct Decoder<PacketStage::initial, PeerConnectivity::p2p, Element, JobMode::gradient> {
         static_assert(flashmoe::TensorValueType<Element>);
@@ -583,9 +514,6 @@ namespace flashmoe::packet {
             const auto sO = TCM * (peer * dA.nLx + localExpertIdx);
             auto* rcData = heap::advance<1, 1>(sHeap, dA.epRank, localExpertIdx);
 
-            // For each row tile, emit tNx gradCombine + 1 gradGateCombine
-            // splitGradients uses gM = BLOCK_M, so tileIdx must be in [0, tNx).
-            // We offset packet and xM pointers per row tile instead of encoding row in tileIdx.
             for (uint rowIdx = 0; rowIdx < totalRowTiles; ++rowIdx) {
                 const auto batchIdx = rowIdx;
                 const auto syncIdx = sO + batchIdx;
@@ -593,13 +521,10 @@ namespace flashmoe::packet {
                     static_cast<uint16_t>(residue);
                 const auto* rowTokenIndices = tokenIndices + rowIdx * BLOCK_M * sizeof(TPS);
 
-                // Per-row offsets: packet is [routedTokens, H], xM is [routedTokens, P]
                 auto* rowPacket = const_cast<cuda::std::byte*>(packet) + rowIdx * BLOCK_M * H * sizeof(Element);
                 auto* rowXM = xMBase + rowIdx * BLOCK_M * P * sizeof(Element);
 
-                // Emit tNx gradCombine tasks (one per column tile of H)
                 for (uint colIdx = 0; colIdx < tNx; ++colIdx) {
-                    // tileIdx is column tile only; splitGradients expects tileIdx in [0, tNx)
                     const auto tileIdx = colIdx;
                     Task gradTask{
                         TaskType::gradCombine,
@@ -625,7 +550,6 @@ namespace flashmoe::packet {
                 }
 
                 // Emit 1 gradGateCombine task per row
-                // Must have full metadata since it may trigger notifyGradient threshold
                 Task gateTask{
                     TaskType::gradGateCombine,
                     rowTokenIndices,
@@ -652,7 +576,6 @@ namespace flashmoe::packet {
     };
 
     /// Specialized initial gradient decoder for remote
-    /// Emits gradCombine + gradGateCombine instead of gradPostGEMM
     template<typename Element>
     struct Decoder<PacketStage::initial, PeerConnectivity::remote, Element, JobMode::gradient> {
         static_assert(flashmoe::TensorValueType<Element>);
@@ -710,9 +633,6 @@ namespace flashmoe::packet {
             const auto sO = TCM * (peer * dA.nLx + localExpertIdx);
             auto* rcData = heap::advance<1, 1>(sHeap, dA.epRank, localExpertIdx);
 
-            // For each row tile, emit tNx gradCombine + 1 gradGateCombine
-            // splitGradients uses gM = BLOCK_M, so tileIdx must be in [0, tNx).
-            // We offset packet and xM pointers per row tile instead of encoding row in tileIdx.
             for (uint rowIdx = 0; rowIdx < totalRowTiles; ++rowIdx) {
                 const auto batchIdx = rowIdx;
                 const auto syncIdx = sO + batchIdx;
@@ -720,7 +640,6 @@ namespace flashmoe::packet {
                     static_cast<uint16_t>(residue);
                 const auto* rowTokenIndices = tokenIndices + rowIdx * BLOCK_M * sizeof(TPS);
 
-                // Per-row offsets: packet is [routedTokens, H], xM is [routedTokens, P]
                 auto* rowPacket = const_cast<cuda::std::byte*>(packet) + rowIdx * BLOCK_M * H * sizeof(Element);
                 auto* rowXM = xMBase + rowIdx * BLOCK_M * P * sizeof(Element);
 
@@ -736,11 +655,11 @@ namespace flashmoe::packet {
                         tileIdx,
                         localExpertIdx
                     };
-                    gradTask.cData[0] = rowPacket;  // Row-offset destination for split gradients
-                    gradTask.cData[1] = rowXM;      // Row-offset xM for notifyGradient chain
+                    gradTask.cData[0] = rowPacket;
+                    gradTask.cData[1] = rowXM;
                     gradTask.syncIdx = syncIdx;
                     gradTask.M = padM;
-                    gradTask.peerIdx = gPeer;  // Use global peer for heap addressing and NVSHMEM
+                    gradTask.peerIdx = gPeer;
                     gradTask.batchIdx = batchIdx;
                     gradTask.isPeerRemote = true;
                     gradTask.bData = weights;
@@ -752,7 +671,6 @@ namespace flashmoe::packet {
                 }
 
                 // Emit 1 gradGateCombine task per row
-                // Must have full metadata since it may trigger notifyGradient threshold
                 Task gateTask{
                     TaskType::gradGateCombine,
                     rowTokenIndices,
@@ -793,9 +711,6 @@ namespace flashmoe::packet {
                 TaskType::combine : TaskType::gradCombine;
             constexpr auto isGradient = m == JobMode::gradient;
             const auto emitTask = [&](const Task& task) {
-                // Fix: Multiple blocks may share tQHead[tIdx]. Use device-scoped atomic
-                // for unique slot reservation across all blocks. Visibility ordering:
-                // atomicAdd → write → fence ensures task is visible when count is read.
                 const auto slot = atomicAdd(tQHead, 1U);
                 const auto dest = DQ::sNext(slot);
                 if (dest >= bookkeeping.sT) {
@@ -815,7 +730,6 @@ namespace flashmoe::packet {
                 tileIdx,
                 expertIdx
             };
-            // cData[0] = output destination for split gradients (writes to expert packet)
             gradTask.cData[0] = const_cast<cuda::std::byte*>(packet);
             emitTask(gradTask);
             if constexpr (isGradient) {
@@ -833,13 +747,13 @@ namespace flashmoe::packet {
         }
     };
 
-    // specialized gradient decoder
+    // specialized gradient decoder for P2P last stage
     template<typename Element>
     struct Decoder<PacketStage::last, PeerConnectivity::p2p, Element, JobMode::gradient> {
         __device__ __forceinline__
         void operator()(
             const DecoderArg& dA,
-            cuda::std::byte* __restrict__ const& pGB, // post GEMM buffer (xM)
+            cuda::std::byte* __restrict__ const& pGB,
             Task* __restrict__ const& tQ,
             unsigned int& lTQHead,
             const cuda::std::byte* const& packet,
@@ -860,9 +774,6 @@ namespace flashmoe::packet {
             constexpr auto TN = ACC::TN::value;
 
             const auto emitTask = [&](const Task& task) {
-                // Fix: Multiple blocks may share tQHead[tIdx]. Use device-scoped atomic
-                // for unique slot reservation across all blocks. Visibility ordering:
-                // atomicAdd → write → fence ensures task is visible when count is read.
                 const auto slot = atomicAdd(tQHead, 1U);
                 const auto dest = DQ::sNext(slot);
                 if (dest >= bookkeeping.sT) {
@@ -874,8 +785,6 @@ namespace flashmoe::packet {
                 __threadfence_system();
             };
 
-            // xMLocation needs row offset: subscriber already offsets packet and tokenIndices,
-            // but xM base is per-expert. Add batchIdx * BLOCK_M row offset for consistency.
             const auto xMBaseOffset = (peerIdx * dA.nLx + localExpertIdx) * pEC * P * sizeof(Element);
             const auto xMRowOffset = batchIdx * BLOCK_M * P * sizeof(Element);
             auto* xMLocation = pGB + xMBaseOffset + xMRowOffset;
@@ -906,10 +815,6 @@ namespace flashmoe::packet {
             gradTask.dData = savedActivations;  // Base pointers (unused by processor)
             gradTask.rcData = rcData;
             gradTask.flags = flags;
-// #if FLASHMOE_DEBUG
-//             printf("DEBUG gLPd DECODE: expert=%u localExpert=%u peer=%u syncIdx=%u tileIdx=%u flags=%p batchIdx=%u\n",
-//                    expertIdx, localExpertIdx, peerIdx, syncIdx, tileIdx, flags, batchIdx);
-// #endif
             emitTask(gradTask);
 
             {
@@ -965,7 +870,6 @@ namespace flashmoe::packet {
                     i,
                     expertIdx
                 };
-                // cData[0] = output destination for split gradients (writes to expert packet)
                 gradTask.cData[0] = const_cast<cuda::std::byte*>(packet);
                 dA.tQ[DQ::next(qIdx, i)] = gradTask;
             }
@@ -1029,8 +933,6 @@ namespace flashmoe::packet {
                 return;
             }
 
-            // xMLocation needs row offset: subscriber already offsets packet and tokenIndices,
-            // but xM base is per-expert. Add batchIdx * BLOCK_M row offset for consistency.
             const auto xMBaseOffset = (peerIdx * dA.nLx + localExpertIdx) * pEC * P * sizeof(Element);
             const auto xMRowOffset = batchIdx * BLOCK_M * P * sizeof(Element);
             auto* xMLocation = pGB + xMBaseOffset + xMRowOffset;

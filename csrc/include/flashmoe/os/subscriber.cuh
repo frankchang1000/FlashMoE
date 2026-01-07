@@ -391,35 +391,6 @@ namespace flashmoe::subscriber{
                                 const auto* tI = &tokenIds(expertIdx, tokenIdx);
                                 const auto* packet = heap::advance<1, 1>(dA.sHeap, lookup.epRank,
                                         lookup.localExpertIndex, tokenIdx);
-// #if FLASHMOE_DEBUG
-//                                 if (isGradientPacket && !laneId) {
-//                                     printf("DEBUG grad subscriber final decode sb=%u block=%u warp=%u flag=%u expert=%u peer=%u remote=%u tokens=%u ltQHead=%u tQH=%p\n",
-//                                            localSeqBit,
-//                                            blockIdx.x,
-//                                            warpId,
-//                                            flagIdx,
-//                                            expertIdx,
-//                                            lookup.epRank,
-//                                            static_cast<unsigned>(lookup.isRemote),
-//                                            sP->tokensM,
-//                                            ltQHead,
-//                                            tQHead);
-//                                 }
-                                // if (!isGradientPacket && !laneId) {
-                                //     printf("DEBUG fwd subscriber final decode (residue) rank=%d sb=%u tIdx=%u j=%u flagIdx=%u bIdx=%u expertIdx=%u remote=%u tokens=%u batchIdx=%u ltQHead=%u\n",
-                                //            nvshmem_my_pe(),
-                                //            localSeqBit,
-                                //            tIdx,
-                                //            j,
-                                //            flagIdx,
-                                //            bIdx,
-                                //            expertIdx,
-                                //            static_cast<unsigned>(lookup.isRemote),
-                                //            sP->tokensM,
-                                //            sP->batchIdx,
-                                //            ltQHead);
-                                // }
-// #endif
                                 if (lookup.isRemote) {
                                     // enforce memory consistency
                                     eMC(sSeqBit, localSeqBit);

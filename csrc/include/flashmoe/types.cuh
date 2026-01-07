@@ -1006,7 +1006,6 @@ namespace flashmoe{
             sizeof(BookType) == sizeof(mp_t));
         __host__ __device__ __forceinline__
         unsigned long queueSpanEntries() const {
-            // 4*gtQCl = 2*gtQCl (tQH for gradPostGEMM/gradGateGEMM + gradPreGEMM) + 2*gtQCl (extended tSA for combine task sync counters)
             return 4UL * gtQCl +
                 ACC::PeakHardware::OS::processorBlocks::value +
                 2UL * ACC::E::value;

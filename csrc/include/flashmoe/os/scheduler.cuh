@@ -95,19 +95,9 @@ namespace flashmoe::scheduler {
         queueSlot -= lTt;
         auto prefixTaskSum = 0U;
         constexpr auto pL = processors / wS;
-// #if FLASHMOE_DEBUG
-//         uint stuckCounter = 0U;
-// #endif
         while (taskTally) {
             // Find processors if we are not currently aware of any
             while (!processorTally) {
-// #if FLASHMOE_DEBUG
-//                 stuckCounter++;
-//                 if (!threadIdx.x && stuckCounter >= 1000 && stuckCounter % 1000 == 0) {
-//                     printf("DEBUG scheduler-stuck rank=%d stuck_iter=%u taskTally=%u processorTally=%u gRQIdx=%u\n",
-//                            nvshmem_my_pe(), stuckCounter, taskTally, processorTally, gRQIdx);
-//                 }
-// #endif
                 // sweep sQ to identify ready processes
                 uint lPt = 0U; // local processor tally
                 #pragma unroll
@@ -127,13 +117,6 @@ namespace flashmoe::scheduler {
                 // Aggregate tally across the warp
                 WarpScan(wSt[1]).InclusiveSum(lPt, startIdx, processorTally);
                 startIdx -= lPt;
-// #if FLASHMOE_DEBUG
-//                 if (!threadIdx.x && processorTally > 0 && stuckCounter >= 1000) {
-//                     printf("DEBUG scheduler-found-processors rank=%d after_stuck=%u found=%u\n",
-//                            nvshmem_my_pe(), stuckCounter, processorTally);
-//                     stuckCounter = 0U;
-//                 }
-// #endif
                 // write to rQ
                 const auto qSIdx = gRQIdx + prefixTaskSum;
                 #pragma unroll
@@ -368,23 +351,7 @@ namespace flashmoe::scheduler {
         uint gRQIdx = 0U;
         uint processorTally = processors; // initially, all processors are available, ensure that rQ has all pids
         auto tTB = atomicLoad<cuda::thread_scope_block>(taskBound);
-// #if FLASHMOE_DEBUG
-//         if (!threadIdx.x) {
-//             printf("DEBUG scheduler-init rank=%d processors=%u gtQCl=%u taskBound=%u sO=%u dT=%u\n",
-//                    nvshmem_my_pe(), processors, gtQCL, tTB, sO, dT);
-//         }
-//         uint loopIter = 0U;
-// #endif
         while (scheduled < tTB) {
-// #if FLASHMOE_DEBUG
-//             if (!threadIdx.x) {
-//                 loopIter++;
-//                 // if (loopIter <= 5 || loopIter % 100 == 0) {
-//                 //     printf("DEBUG scheduler-iteration rank=%d iter=%u scheduled=%u taskBound=%u\n",
-//                 //            nvshmem_my_pe(), loopIter, scheduled, tTB);
-//                 // }
-//             }
-// #endif
             // statically sweep tQ for tasks
             uint lTt = 0U; // local task tally
             #pragma unroll
@@ -479,15 +446,6 @@ namespace flashmoe::scheduler {
             }
             tTB = __shfl_sync(0xffffffff, tTB, 0);
         }
-// #if FLASHMOE_DEBUG
-//         if (!threadIdx.x) {
-//             printf("DEBUG scheduler-exit rank=%d scheduled=%u taskBound=%u iterations=%u\n",
-//                    nvshmem_my_pe(),
-//                    scheduled,
-//                    tTB,
-//                    loopIter);
-//         }
-// #endif
         // interrupt subscribers
         static_assert(subscribers % wS == 0);
         #pragma unroll
