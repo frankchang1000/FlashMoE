@@ -243,7 +243,7 @@ def run_manual_gradcheck():
             max_rel_error = max(max_rel_error, rel_error)
 
             status = "OK" if rel_error < 0.05 else "MISMATCH"
-            print(f"  {name}[{idx}]: numerical={numerical_grad:.6f}, analytical={analytical_grad:.6f}, rel_err={rel_error:.4f} [{status}]")
+            print(f"  {name}[{idx}]: numerical={numerical_grad:.6e}, analytical={analytical_grad:.6e}, rel_err={rel_error:.4f} [{status}]")
 
     tensors_with_grads = sum(1 for t in [input_tensor, gate_weights, expert_weights] if t.grad is not None)
     if tensors_with_grads == 0:
