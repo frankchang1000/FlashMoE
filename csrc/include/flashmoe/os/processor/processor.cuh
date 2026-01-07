@@ -344,6 +344,36 @@ namespace flashmoe::processor{
             }
             __syncthreads();
         }
+        // DEBUG: Print sample input/output values to verify correctness
+        // Print for rank 0, first few blocks to limit spam
+        if (!threadIdx.x && nvshmem_my_pe() == 0 && blockIdx.x < 4) {
+            // Sample TPS entries (tokenIdx, probability)
+            printf("DEBUG splitGradients VALUES: rank=%d block=%u tileIdx=%u tileSize=%u expert=%u\n",
+                   nvshmem_my_pe(), blockIdx.x, tileIdx, tileSize, expertIdx);
+            for (uint i = 0; i < min(4u, static_cast<uint>(tileSize)); ++i) {
+                printf("  TPS[%u]: tokenIdx=%u prob=%.6f\n", i, sTPS[i].tokenIdx, static_cast<float>(sTPS[i].probability));
+            }
+            // Sample gradOutput values for first token
+            if (tileSize > 0) {
+                const auto tok0 = sTPS[0].tokenIdx;
+                printf("  gradOutput[tok=%u, 0..3]: %.6e %.6e %.6e %.6e\n",
+                       tok0,
+                       static_cast<float>(gradOutput[tok0 * N + 0]),
+                       static_cast<float>(gradOutput[tok0 * N + 1]),
+                       static_cast<float>(gradOutput[tok0 * N + 2]),
+                       static_cast<float>(gradOutput[tok0 * N + 3]));
+                // Expected output: (gradOutput[tok, col] / probability) * scale
+                const auto prob0 = static_cast<float>(sTPS[0].probability);
+                const auto scale0 = static_cast<float>(scale(tok0, expertIdx));
+                const auto expectedVal = static_cast<float>(gradOutput[tok0 * N + 0]) / prob0 * scale0;
+                printf("  expected expertGrad[0,0] = %.6e / %.6e * %.6e = %.6e\n",
+                       static_cast<float>(gradOutput[tok0 * N + 0]),
+                       prob0,
+                       scale0,
+                       expectedVal);
+            }
+        }
+        __syncthreads();
 #endif
 
         if constexpr (c == CombineMode::multithreaded) {
@@ -459,6 +489,41 @@ namespace flashmoe::processor{
                 }
             }
         }
+
+#if FLASHMOE_DEBUG
+        // DEBUG: Print sample output values after computation
+        __syncthreads();
+        if (!threadIdx.x && nvshmem_my_pe() == 0 && blockIdx.x < 4) {
+            // tileIdx maps to 2D coord: rowTile = tileIdx / tilesN, colTile = tileIdx % tilesN
+            // Each tile writes to [rowTile * bM, colTile * bN] offset
+            const uint rowTile = tileIdx / tilesN;
+            const uint colTile = tileIdx % tilesN;
+            const uint outRowOffset = rowTile * bM;
+            const uint outColOffset = colTile * bN;
+            printf("  OUTPUT expertGrad[row=%u, col=%u..%u]: %.6e %.6e %.6e %.6e (block=%u tile=%u rowT=%u colT=%u)\n",
+                   outRowOffset, outColOffset, outColOffset + 3,
+                   static_cast<float>(expertGradients[outRowOffset * N + outColOffset + 0]),
+                   static_cast<float>(expertGradients[outRowOffset * N + outColOffset + 1]),
+                   static_cast<float>(expertGradients[outRowOffset * N + outColOffset + 2]),
+                   static_cast<float>(expertGradients[outRowOffset * N + outColOffset + 3]),
+                   blockIdx.x, tileIdx, rowTile, colTile);
+            // Compare with expected - use column from THIS tile's range
+            if (tileSize > 0) {
+                const auto tok0 = sTPS[0].tokenIdx;
+                const auto prob0 = static_cast<float>(sTPS[0].probability);
+                const auto scale0 = static_cast<float>(scale(tok0, expertIdx));
+                // gradOutput is indexed by tokenIdx (full row), so we read the col that this tile writes to
+                // expected = (gradOutput / prob) * scale
+                printf("  VERIFY: gradOut[%u,%u]=%.6e / prob=%.6e * scale=%.6e -> expected=%.6e, actual=%.6e\n",
+                       tok0, outColOffset,
+                       static_cast<float>(gradOutput[tok0 * N + outColOffset]),
+                       prob0,
+                       scale0,
+                       static_cast<float>(gradOutput[tok0 * N + outColOffset]) / prob0 * scale0,
+                       static_cast<float>(expertGradients[outRowOffset * N + outColOffset]));
+            }
+        }
+#endif
     }
 
     // fused GEMM, epilogue and data transfer, with static M, N and K
