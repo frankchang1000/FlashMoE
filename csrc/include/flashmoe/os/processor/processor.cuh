@@ -344,36 +344,36 @@ namespace flashmoe::processor{
             }
             __syncthreads();
         }
-        // DEBUG: Print sample input/output values to verify correctness
-        // Print for rank 0, first few blocks to limit spam
-        if (!threadIdx.x && nvshmem_my_pe() == 0 && blockIdx.x < 4) {
-            // Sample TPS entries (tokenIdx, probability)
-            printf("DEBUG splitGradients VALUES: rank=%d block=%u tileIdx=%u tileSize=%u expert=%u\n",
-                   nvshmem_my_pe(), blockIdx.x, tileIdx, tileSize, expertIdx);
-            for (uint i = 0; i < min(4u, static_cast<uint>(tileSize)); ++i) {
-                printf("  TPS[%u]: tokenIdx=%u prob=%.6f\n", i, sTPS[i].tokenIdx, static_cast<float>(sTPS[i].probability));
-            }
-            // Sample gradOutput values for first token
-            if (tileSize > 0) {
-                const auto tok0 = sTPS[0].tokenIdx;
-                printf("  gradOutput[tok=%u, 0..3]: %.6e %.6e %.6e %.6e\n",
-                       tok0,
-                       static_cast<float>(gradOutput[tok0 * N + 0]),
-                       static_cast<float>(gradOutput[tok0 * N + 1]),
-                       static_cast<float>(gradOutput[tok0 * N + 2]),
-                       static_cast<float>(gradOutput[tok0 * N + 3]));
-                // Expected output: (gradOutput[tok, col] / probability) * scale
-                const auto prob0 = static_cast<float>(sTPS[0].probability);
-                const auto scale0 = static_cast<float>(scale(tok0, expertIdx));
-                const auto expectedVal = static_cast<float>(gradOutput[tok0 * N + 0]) / prob0 * scale0;
-                printf("  expected expertGrad[0,0] = %.6e / %.6e * %.6e = %.6e\n",
-                       static_cast<float>(gradOutput[tok0 * N + 0]),
-                       prob0,
-                       scale0,
-                       expectedVal);
-            }
-        }
-        __syncthreads();
+//         // DEBUG: Print sample input/output values to verify correctness
+//         // Print for rank 0, first few blocks to limit spam
+//         if (!threadIdx.x && nvshmem_my_pe() == 0 && blockIdx.x < 4) {
+//             // Sample TPS entries (tokenIdx, probability)
+//             printf("DEBUG splitGradients VALUES: rank=%d block=%u tileIdx=%u tileSize=%u expert=%u\n",
+//                    nvshmem_my_pe(), blockIdx.x, tileIdx, tileSize, expertIdx);
+//             for (uint i = 0; i < min(4u, static_cast<uint>(tileSize)); ++i) {
+//                 printf("  TPS[%u]: tokenIdx=%u prob=%.6f\n", i, sTPS[i].tokenIdx, static_cast<float>(sTPS[i].probability));
+//             }
+//             // Sample gradOutput values for first token
+//             if (tileSize > 0) {
+//                 const auto tok0 = sTPS[0].tokenIdx;
+//                 printf("  gradOutput[tok=%u, 0..3]: %.6e %.6e %.6e %.6e\n",
+//                        tok0,
+//                        static_cast<float>(gradOutput[tok0 * N + 0]),
+//                        static_cast<float>(gradOutput[tok0 * N + 1]),
+//                        static_cast<float>(gradOutput[tok0 * N + 2]),
+//                        static_cast<float>(gradOutput[tok0 * N + 3]));
+//                 // Expected output: (gradOutput[tok, col] / probability) * scale
+//                 const auto prob0 = static_cast<float>(sTPS[0].probability);
+//                 const auto scale0 = static_cast<float>(scale(tok0, expertIdx));
+//                 const auto expectedVal = static_cast<float>(gradOutput[tok0 * N + 0]) / prob0 * scale0;
+//                 printf("  expected expertGrad[0,0] = %.6e / %.6e * %.6e = %.6e\n",
+//                        static_cast<float>(gradOutput[tok0 * N + 0]),
+//                        prob0,
+//                        scale0,
+//                        expectedVal);
+//             }
+//         }
+//         __syncthreads();
 #endif
 
         if constexpr (c == CombineMode::multithreaded) {
@@ -490,40 +490,40 @@ namespace flashmoe::processor{
             }
         }
 
-#if FLASHMOE_DEBUG
-        // DEBUG: Print sample output values after computation
-        __syncthreads();
-        if (!threadIdx.x && nvshmem_my_pe() == 0 && blockIdx.x < 4) {
-            // tileIdx maps to 2D coord: rowTile = tileIdx / tilesN, colTile = tileIdx % tilesN
-            // Each tile writes to [rowTile * bM, colTile * bN] offset
-            const uint rowTile = tileIdx / tilesN;
-            const uint colTile = tileIdx % tilesN;
-            const uint outRowOffset = rowTile * bM;
-            const uint outColOffset = colTile * bN;
-            printf("  OUTPUT expertGrad[row=%u, col=%u..%u]: %.6e %.6e %.6e %.6e (block=%u tile=%u rowT=%u colT=%u)\n",
-                   outRowOffset, outColOffset, outColOffset + 3,
-                   static_cast<float>(expertGradients[outRowOffset * N + outColOffset + 0]),
-                   static_cast<float>(expertGradients[outRowOffset * N + outColOffset + 1]),
-                   static_cast<float>(expertGradients[outRowOffset * N + outColOffset + 2]),
-                   static_cast<float>(expertGradients[outRowOffset * N + outColOffset + 3]),
-                   blockIdx.x, tileIdx, rowTile, colTile);
-            // Compare with expected - use column from THIS tile's range
-            if (tileSize > 0) {
-                const auto tok0 = sTPS[0].tokenIdx;
-                const auto prob0 = static_cast<float>(sTPS[0].probability);
-                const auto scale0 = static_cast<float>(scale(tok0, expertIdx));
-                // gradOutput is indexed by tokenIdx (full row), so we read the col that this tile writes to
-                // expected = (gradOutput / prob) * scale
-                printf("  VERIFY: gradOut[%u,%u]=%.6e / prob=%.6e * scale=%.6e -> expected=%.6e, actual=%.6e\n",
-                       tok0, outColOffset,
-                       static_cast<float>(gradOutput[tok0 * N + outColOffset]),
-                       prob0,
-                       scale0,
-                       static_cast<float>(gradOutput[tok0 * N + outColOffset]) / prob0 * scale0,
-                       static_cast<float>(expertGradients[outRowOffset * N + outColOffset]));
-            }
-        }
-#endif
+// #if FLASHMOE_DEBUG
+//         // DEBUG: Print sample output values after computation
+//         __syncthreads();
+//         if (!threadIdx.x && nvshmem_my_pe() == 0 && blockIdx.x < 4) {
+//             // tileIdx maps to 2D coord: rowTile = tileIdx / tilesN, colTile = tileIdx % tilesN
+//             // Each tile writes to [rowTile * bM, colTile * bN] offset
+//             const uint rowTile = tileIdx / tilesN;
+//             const uint colTile = tileIdx % tilesN;
+//             const uint outRowOffset = rowTile * bM;
+//             const uint outColOffset = colTile * bN;
+//             printf("  OUTPUT expertGrad[row=%u, col=%u..%u]: %.6e %.6e %.6e %.6e (block=%u tile=%u rowT=%u colT=%u)\n",
+//                    outRowOffset, outColOffset, outColOffset + 3,
+//                    static_cast<float>(expertGradients[outRowOffset * N + outColOffset + 0]),
+//                    static_cast<float>(expertGradients[outRowOffset * N + outColOffset + 1]),
+//                    static_cast<float>(expertGradients[outRowOffset * N + outColOffset + 2]),
+//                    static_cast<float>(expertGradients[outRowOffset * N + outColOffset + 3]),
+//                    blockIdx.x, tileIdx, rowTile, colTile);
+//             // Compare with expected - use column from THIS tile's range
+//             if (tileSize > 0) {
+//                 const auto tok0 = sTPS[0].tokenIdx;
+//                 const auto prob0 = static_cast<float>(sTPS[0].probability);
+//                 const auto scale0 = static_cast<float>(scale(tok0, expertIdx));
+//                 // gradOutput is indexed by tokenIdx (full row), so we read the col that this tile writes to
+//                 // expected = (gradOutput / prob) * scale
+//                 printf("  VERIFY: gradOut[%u,%u]=%.6e / prob=%.6e * scale=%.6e -> expected=%.6e, actual=%.6e\n",
+//                        tok0, outColOffset,
+//                        static_cast<float>(gradOutput[tok0 * N + outColOffset]),
+//                        prob0,
+//                        scale0,
+//                        static_cast<float>(gradOutput[tok0 * N + outColOffset]) / prob0 * scale0,
+//                        static_cast<float>(expertGradients[outRowOffset * N + outColOffset]));
+//             }
+//         }
+// #endif
     }
 
     // fused GEMM, epilogue and data transfer, with static M, N and K
@@ -2488,42 +2488,42 @@ namespace flashmoe::processor{
                                    nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx, rCurrentTask.M,
                                    xMOffset2, rowIdx2, z2Base, z2Activation, rCurrentTask.cData[w1Index]);
                         }
-                        // DEBUG: Print INPUT values for gradPostGEMM correctness verification
-                        // Math: grad_intermediate = (grad_output * act'(z2)) @ W2^T  (W2 stored as [H,P])
-                        // For identity activation: grad_intermediate = grad_output @ W2
-                        if (!threadIdx.x && nvshmem_my_pe() == 0 && blockIdx.x < 4) {
-                            auto* gradOut = CONST_CAST_TO(Element, rCurrentTask.aData);  // grad_output [M, H]
-                            auto* W2 = CONST_CAST_TO(Element, rCurrentTask.bData[w2Index]);  // W2 [H, P]
-                            printf("DEBUG gradPostGEMM VALUES: rank=%d block=%u tileIdx=%u M=%u expert=%u syncIdx=%u\n",
-                                   nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx, rCurrentTask.M,
-                                   rCurrentTask.expertIdx, rCurrentTask.syncIdx);
-                            // Sample grad_output values (first row, first 4 cols)
-                            printf("  grad_output[0, 0..3]: %.6e %.6e %.6e %.6e\n",
-                                   static_cast<float>(gradOut[0 * H + 0]),
-                                   static_cast<float>(gradOut[0 * H + 1]),
-                                   static_cast<float>(gradOut[0 * H + 2]),
-                                   static_cast<float>(gradOut[0 * H + 3]));
-                            // Sample z2 values (activation derivative input)
-                            printf("  z2[0, 0..3]: %.6e %.6e %.6e %.6e\n",
-                                   static_cast<float>(z2Activation[0 * H + 0]),
-                                   static_cast<float>(z2Activation[0 * H + 1]),
-                                   static_cast<float>(z2Activation[0 * H + 2]),
-                                   static_cast<float>(z2Activation[0 * H + 3]));
-                            // Sample W2 values (first row = W2[0,:], which contributes to output[:,0])
-                            // W2 is [H, P], so W2[h, p] = W2[h * P + p]
-                            printf("  W2[0..3, 0]: %.6e %.6e %.6e %.6e (first 4 rows of col 0)\n",
-                                   static_cast<float>(W2[0 * P + 0]),
-                                   static_cast<float>(W2[1 * P + 0]),
-                                   static_cast<float>(W2[2 * P + 0]),
-                                   static_cast<float>(W2[3 * P + 0]));
-                            // Compute partial expected output[0,0] = sum_h (grad_output[0,h] * act'(z2[0,h])) * W2[h,0]
-                            // For identity activation: act'(z2) = 1, so output[0,0] = sum_h grad_output[0,h] * W2[h,0]
-                            float partial_sum = 0.0f;
-                            for (uint h = 0; h < min(4u, H); ++h) {
-                                partial_sum += static_cast<float>(gradOut[0 * H + h]) * static_cast<float>(W2[h * P + 0]);
-                            }
-                            printf("  partial expected output[0,0] (first 4 h terms): %.6e\n", partial_sum);
-                        }
+//                         // DEBUG: Print INPUT values for gradPostGEMM correctness verification
+//                         // Math: grad_intermediate = (grad_output * act'(z2)) @ W2^T  (W2 stored as [H,P])
+//                         // For identity activation: grad_intermediate = grad_output @ W2
+//                         if (!threadIdx.x && nvshmem_my_pe() == 0 && blockIdx.x < 4) {
+//                             auto* gradOut = CONST_CAST_TO(Element, rCurrentTask.aData);  // grad_output [M, H]
+//                             auto* W2 = CONST_CAST_TO(Element, rCurrentTask.bData[w2Index]);  // W2 [H, P]
+//                             printf("DEBUG gradPostGEMM VALUES: rank=%d block=%u tileIdx=%u M=%u expert=%u syncIdx=%u\n",
+//                                    nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx, rCurrentTask.M,
+//                                    rCurrentTask.expertIdx, rCurrentTask.syncIdx);
+//                             // Sample grad_output values (first row, first 4 cols)
+//                             printf("  grad_output[0, 0..3]: %.6e %.6e %.6e %.6e\n",
+//                                    static_cast<float>(gradOut[0 * H + 0]),
+//                                    static_cast<float>(gradOut[0 * H + 1]),
+//                                    static_cast<float>(gradOut[0 * H + 2]),
+//                                    static_cast<float>(gradOut[0 * H + 3]));
+//                             // Sample z2 values (activation derivative input)
+//                             printf("  z2[0, 0..3]: %.6e %.6e %.6e %.6e\n",
+//                                    static_cast<float>(z2Activation[0 * H + 0]),
+//                                    static_cast<float>(z2Activation[0 * H + 1]),
+//                                    static_cast<float>(z2Activation[0 * H + 2]),
+//                                    static_cast<float>(z2Activation[0 * H + 3]));
+//                             // Sample W2 values (first row = W2[0,:], which contributes to output[:,0])
+//                             // W2 is [H, P], so W2[h, p] = W2[h * P + p]
+//                             printf("  W2[0..3, 0]: %.6e %.6e %.6e %.6e (first 4 rows of col 0)\n",
+//                                    static_cast<float>(W2[0 * P + 0]),
+//                                    static_cast<float>(W2[1 * P + 0]),
+//                                    static_cast<float>(W2[2 * P + 0]),
+//                                    static_cast<float>(W2[3 * P + 0]));
+//                             // Compute partial expected output[0,0] = sum_h (grad_output[0,h] * act'(z2[0,h])) * W2[h,0]
+//                             // For identity activation: act'(z2) = 1, so output[0,0] = sum_h grad_output[0,h] * W2[h,0]
+//                             float partial_sum = 0.0f;
+//                             for (uint h = 0; h < min(4u, H); ++h) {
+//                                 partial_sum += static_cast<float>(gradOut[0 * H + h]) * static_cast<float>(W2[h * P + 0]);
+//                             }
+//                             printf("  partial expected output[0,0] (first 4 h terms): %.6e\n", partial_sum);
+//                         }
 #endif
                         // grad_output [M, H], z2 [M, H] (K=H), W2_stored [H, P] (K=H, N=P), output [M, P]
                         fGETGrad<GradPostGEMM, ACC::P::value, ACC::H::value>(
@@ -2534,42 +2534,42 @@ namespace flashmoe::processor{
                             CONST_CAST_TO(typename GradPostGEMM::MatrixDType, z2Activation),  // z2 [M, H] (K=H)
                             rCurrentTask.M,
                             rCurrentTask.tileIdx);
-#if FLASHMOE_DEBUG
-                        // DEBUG: Print OUTPUT values after fGETGrad to verify correctness
-                        __syncthreads();
-                        if (!threadIdx.x && nvshmem_my_pe() == 0 && blockIdx.x < 4) {
-                            auto* output = CAST_TO(Element, rCurrentTask.cData[w2Index]);  // grad_intermediate [M, P]
-                            auto* gradOut = CONST_CAST_TO(Element, rCurrentTask.aData);    // grad_output [M, H]
-                            auto* W2 = CONST_CAST_TO(Element, rCurrentTask.bData[w2Index]); // W2 [H, P]
-                            // tileIdx encodes 2D position: tileIdx = rowTile * tilesP + colTile
-                            // tilesP = P / BLOCK_N (number of column tiles)
-                            constexpr uint tilesP = P / BLOCK_N;
-                            const uint rowTile = rCurrentTask.tileIdx / tilesP;
-                            const uint colTile = rCurrentTask.tileIdx % tilesP;
-                            const uint outRowOffset = rowTile * BLOCK_M;
-                            const uint outColOffset = colTile * BLOCK_N;
-                            printf("  OUTPUT grad_intermediate[row=%u, col=%u..%u]: %.6e %.6e %.6e %.6e (tile=%u rowT=%u colT=%u)\n",
-                                   outRowOffset, outColOffset, outColOffset + 3,
-                                   static_cast<float>(output[outRowOffset * P + outColOffset + 0]),
-                                   static_cast<float>(output[outRowOffset * P + outColOffset + 1]),
-                                   static_cast<float>(output[outRowOffset * P + outColOffset + 2]),
-                                   static_cast<float>(output[outRowOffset * P + outColOffset + 3]),
-                                   rCurrentTask.tileIdx, rowTile, colTile);
-                            // Full expected calculation for output[0, outColOffset]
-                            // output[row, col] = sum_h (grad_output[row, h] * act'(z2[row, h])) * W2[h, col]
-                            // For identity: output[0, outColOffset] = sum_h grad_output[0, h] * W2[h, outColOffset]
-                            if (outRowOffset == 0) {
-                                float full_sum = 0.0f;
-                                for (uint h = 0; h < H; ++h) {
-                                    full_sum += static_cast<float>(gradOut[0 * H + h]) * static_cast<float>(W2[h * P + outColOffset]);
-                                }
-                                printf("  VERIFY: expected output[0,%u]=%.6e, actual=%.6e, diff=%.6e\n",
-                                       outColOffset, full_sum,
-                                       static_cast<float>(output[0 * P + outColOffset]),
-                                       full_sum - static_cast<float>(output[0 * P + outColOffset]));
-                            }
-                        }
-#endif
+// #if FLASHMOE_DEBUG
+//                         // DEBUG: Print OUTPUT values after fGETGrad to verify correctness
+//                         __syncthreads();
+//                         if (!threadIdx.x && nvshmem_my_pe() == 0 && blockIdx.x < 4) {
+//                             auto* output = CAST_TO(Element, rCurrentTask.cData[w2Index]);  // grad_intermediate [M, P]
+//                             auto* gradOut = CONST_CAST_TO(Element, rCurrentTask.aData);    // grad_output [M, H]
+//                             auto* W2 = CONST_CAST_TO(Element, rCurrentTask.bData[w2Index]); // W2 [H, P]
+//                             // tileIdx encodes 2D position: tileIdx = rowTile * tilesP + colTile
+//                             // tilesP = P / BLOCK_N (number of column tiles)
+//                             constexpr uint tilesP = P / BLOCK_N;
+//                             const uint rowTile = rCurrentTask.tileIdx / tilesP;
+//                             const uint colTile = rCurrentTask.tileIdx % tilesP;
+//                             const uint outRowOffset = rowTile * BLOCK_M;
+//                             const uint outColOffset = colTile * BLOCK_N;
+//                             printf("  OUTPUT grad_intermediate[row=%u, col=%u..%u]: %.6e %.6e %.6e %.6e (tile=%u rowT=%u colT=%u)\n",
+//                                    outRowOffset, outColOffset, outColOffset + 3,
+//                                    static_cast<float>(output[outRowOffset * P + outColOffset + 0]),
+//                                    static_cast<float>(output[outRowOffset * P + outColOffset + 1]),
+//                                    static_cast<float>(output[outRowOffset * P + outColOffset + 2]),
+//                                    static_cast<float>(output[outRowOffset * P + outColOffset + 3]),
+//                                    rCurrentTask.tileIdx, rowTile, colTile);
+//                             // Full expected calculation for output[0, outColOffset]
+//                             // output[row, col] = sum_h (grad_output[row, h] * act'(z2[row, h])) * W2[h, col]
+//                             // For identity: output[0, outColOffset] = sum_h grad_output[0, h] * W2[h, outColOffset]
+//                             if (outRowOffset == 0) {
+//                                 float full_sum = 0.0f;
+//                                 for (uint h = 0; h < H; ++h) {
+//                                     full_sum += static_cast<float>(gradOut[0 * H + h]) * static_cast<float>(W2[h * P + outColOffset]);
+//                                 }
+//                                 printf("  VERIFY: expected output[0,%u]=%.6e, actual=%.6e, diff=%.6e\n",
+//                                        outColOffset, full_sum,
+//                                        static_cast<float>(output[0 * P + outColOffset]),
+//                                        full_sum - static_cast<float>(output[0 * P + outColOffset]));
+//                             }
+//                         }
+// #endif
                         {
                             const auto localExpertIdx = rCurrentTask.expertIdx;
                             constexpr auto expertStride = 2 * P * H + P + H;
@@ -2691,6 +2691,46 @@ namespace flashmoe::processor{
                                    xMOffset, z1Base, z1Activation,
                                    rCurrentTask.aData, rCurrentTask.cData[w1Index], rCurrentTask.cData[xMIndex]);
                         }
+                        // DEBUG: Print INPUT values for gradPreGEMM correctness verification
+                        // Math: grad_input = (grad_a1 * act'(z1)) @ W1  (W1 stored as [P,H])
+                        // act'(z1) is ReLU' (HIDDEN_ACT=0) or GELU' (HIDDEN_ACT=1)
+                        if (!threadIdx.x && nvshmem_my_pe() == 0 && blockIdx.x < 4) {
+                            auto* gradA1 = CONST_CAST_TO(Element, rCurrentTask.aData);  // grad_a1 [M, P]
+                            auto* W1 = CONST_CAST_TO(Element, rCurrentTask.bData[w1Index]);  // W1 [P, H]
+                            printf("DEBUG gradPreGEMM VALUES: rank=%d block=%u tileIdx=%u M=%u expert=%u syncIdx=%u\n",
+                                   nvshmem_my_pe(), blockIdx.x, rCurrentTask.tileIdx, rCurrentTask.M,
+                                   rCurrentTask.expertIdx, rCurrentTask.syncIdx);
+                            // Sample grad_a1 values (first row, first 4 cols)
+                            printf("  grad_a1[0, 0..3]: %.6e %.6e %.6e %.6e\n",
+                                   static_cast<float>(gradA1[0 * P + 0]),
+                                   static_cast<float>(gradA1[0 * P + 1]),
+                                   static_cast<float>(gradA1[0 * P + 2]),
+                                   static_cast<float>(gradA1[0 * P + 3]));
+                            // Sample z1 values (activation derivative input)
+                            printf("  z1[0, 0..3]: %.6e %.6e %.6e %.6e\n",
+                                   static_cast<float>(z1Activation[0 * P + 0]),
+                                   static_cast<float>(z1Activation[0 * P + 1]),
+                                   static_cast<float>(z1Activation[0 * P + 2]),
+                                   static_cast<float>(z1Activation[0 * P + 3]));
+                            // Sample W1 values (W1 is [P, H], so W1[p, h] = W1[p * H + h])
+                            printf("  W1[0..3, 0]: %.6e %.6e %.6e %.6e (first 4 rows of col 0)\n",
+                                   static_cast<float>(W1[0 * H + 0]),
+                                   static_cast<float>(W1[1 * H + 0]),
+                                   static_cast<float>(W1[2 * H + 0]),
+                                   static_cast<float>(W1[3 * H + 0]));
+                            // Compute partial expected output[0,0] with activation derivative
+                            // ReLU: act'(z) = z > 0 ? 1 : 0
+                            float partial_sum = 0.0f;
+                            for (uint p = 0; p < min(4u, P); ++p) {
+                                float grad_val = static_cast<float>(gradA1[0 * P + p]);
+                                float z1_val = static_cast<float>(z1Activation[0 * P + p]);
+                                float w1_val = static_cast<float>(W1[p * H + 0]);
+                                // ReLU derivative
+                                float act_deriv = z1_val > 0.0f ? 1.0f : 0.0f;
+                                partial_sum += grad_val * act_deriv * w1_val;
+                            }
+                            printf("  partial expected output[0,0] (first 4 p terms, ReLU deriv): %.6e\n", partial_sum);
+                        }
 #endif
                         // grad_a1 [M, P], z1 [M, P] (K=P), W1_stored [P, H] (K=P, N=H), output [M, H]
                         fGETGrad<GradPreGEMM, ACC::H::value, ACC::P::value>(
@@ -2702,6 +2742,45 @@ namespace flashmoe::processor{
                             rCurrentTask.M,
                             rCurrentTask.tileIdx);
                         __syncthreads();
+#if FLASHMOE_DEBUG
+                        // DEBUG: Print OUTPUT values after fGETGrad to verify correctness
+                        if (!threadIdx.x && nvshmem_my_pe() == 0 && blockIdx.x < 4) {
+                            auto* output = CAST_TO(Element, rCurrentTask.cData[w1Index]);  // grad_input [M, H]
+                            auto* gradA1 = CONST_CAST_TO(Element, rCurrentTask.aData);     // grad_a1 [M, P]
+                            auto* W1 = CONST_CAST_TO(Element, rCurrentTask.bData[w1Index]); // W1 [P, H]
+                            // tileIdx encodes 2D position: tileIdx = rowTile * tilesH + colTile
+                            // tilesH = H / BLOCK_N (number of column tiles)
+                            constexpr uint tilesH = H / BLOCK_N;
+                            const uint rowTile = rCurrentTask.tileIdx / tilesH;
+                            const uint colTile = rCurrentTask.tileIdx % tilesH;
+                            const uint outRowOffset = rowTile * BLOCK_M;
+                            const uint outColOffset = colTile * BLOCK_N;
+                            printf("  OUTPUT grad_input[row=%u, col=%u..%u]: %.6e %.6e %.6e %.6e (tile=%u rowT=%u colT=%u)\n",
+                                   outRowOffset, outColOffset, outColOffset + 3,
+                                   static_cast<float>(output[outRowOffset * H + outColOffset + 0]),
+                                   static_cast<float>(output[outRowOffset * H + outColOffset + 1]),
+                                   static_cast<float>(output[outRowOffset * H + outColOffset + 2]),
+                                   static_cast<float>(output[outRowOffset * H + outColOffset + 3]),
+                                   rCurrentTask.tileIdx, rowTile, colTile);
+                            // Full expected calculation for output[0, outColOffset]
+                            // output[row, col] = sum_p (grad_a1[row, p] * act'(z1[row, p])) * W1[p, col]
+                            if (outRowOffset == 0) {
+                                float full_sum = 0.0f;
+                                for (uint p = 0; p < P; ++p) {
+                                    float grad_val = static_cast<float>(gradA1[0 * P + p]);
+                                    float z1_val = static_cast<float>(z1Activation[0 * P + p]);
+                                    float w1_val = static_cast<float>(W1[p * H + outColOffset]);
+                                    // ReLU derivative
+                                    float act_deriv = z1_val > 0.0f ? 1.0f : 0.0f;
+                                    full_sum += grad_val * act_deriv * w1_val;
+                                }
+                                printf("  VERIFY: expected output[0,%u]=%.6e, actual=%.6e, diff=%.6e\n",
+                                       outColOffset, full_sum,
+                                       static_cast<float>(output[0 * H + outColOffset]),
+                                       full_sum - static_cast<float>(output[0 * H + outColOffset]));
+                            }
+                        }
+#endif
                         {
                             const auto peer = rCurrentTask.peerIdx;
                             const auto localExpertIdx = rCurrentTask.expertIdx;
